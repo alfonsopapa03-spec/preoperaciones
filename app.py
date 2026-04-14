@@ -4,6 +4,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import io
 import pytz
+from urllib.parse import quote
 
 # ==================== CONFIG ====================
 st.set_page_config(
@@ -60,7 +61,6 @@ html, body, [class*="css"] { font-family: 'Barlow', sans-serif; }
 """, unsafe_allow_html=True)
 
 # ==================== MAPEO DE COLUMNAS ====================
-# Mapea nombre corto → nombre exacto en Google Sheets
 COLS = {
     "marca_temporal":       "Marca temporal",
     "fecha":                "FECHA: ",
@@ -113,7 +113,6 @@ COLS = {
     "en_taller":            "Antes de contestar las siguientes preguntas confirme si el vehículo se encuentra en el taller:",
 }
 
-# Columnas que son ítems de inspección (para análisis de fallas)
 ITEMS_INSPECCION = {
     "Salud Conductor":    "salud_conductor",
     "Luces":              "luces",
@@ -178,18 +177,16 @@ def es_falla(valor):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cargar_datos_sheets(sheet_id: str, sheet_name: str = "Sheet1") -> pd.DataFrame:
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+    # ✅ CORRECCIÓN: se encodean los espacios y caracteres especiales del nombre de la hoja
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={quote(sheet_name)}"
     try:
         df = pd.read_csv(url)
-        # Renombrar columnas usando el mapeo
         rename_map = {}
         for short, full in COLS.items():
-            # Búsqueda flexible (strip + lower)
             for col in df.columns:
                 if col.strip().lower() == full.strip().lower():
                     rename_map[col] = short
                     break
-                # fallback: buscar si el nombre corto aparece en el nombre largo
             if short not in rename_map.values():
                 for col in df.columns:
                     if full.strip()[:30].lower() in col.strip().lower():
@@ -197,12 +194,10 @@ def cargar_datos_sheets(sheet_id: str, sheet_name: str = "Sheet1") -> pd.DataFra
                         break
         df = df.rename(columns=rename_map)
 
-        # Parsear fechas
         for col_fecha in ["marca_temporal", "fecha"]:
             if col_fecha in df.columns:
                 df[col_fecha] = pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True)
 
-        # Columna auxiliar de estado general
         item_cols = [k for k in ITEMS_INSPECCION.values() if k in df.columns]
         if item_cols:
             df["_fallas_count"] = df[item_cols].apply(
@@ -218,7 +213,6 @@ def cargar_datos_sheets(sheet_id: str, sheet_name: str = "Sheet1") -> pd.DataFra
 
 
 def get_col(df, col_short):
-    """Obtiene columna si existe, si no retorna Serie vacía."""
     if col_short in df.columns:
         return df[col_short]
     return pd.Series([""] * len(df))
@@ -254,7 +248,6 @@ def generar_excel_inspeccion(df: pd.DataFrame) -> bytes:
 
     now_col = datetime.now(BOGOTA_TZ)
 
-    # ---- Hoja 1: Detalle completo ----
     cols_export = [
         ("marca_temporal", "FECHA REGISTRO", 18),
         ("fecha",          "FECHA",          12),
@@ -271,7 +264,6 @@ def generar_excel_inspeccion(df: pd.DataFrame) -> bytes:
         ("en_taller",      "EN TALLER",       12),
         ("firma_supervisor","SUPERVISOR",      22),
     ]
-    # Agregar ítems de inspección
     for label, short in ITEMS_INSPECCION.items():
         cols_export.append((short, label.upper(), 20))
 
@@ -319,7 +311,6 @@ def generar_excel_inspeccion(df: pd.DataFrame) -> bytes:
 
     ws.freeze_panes = "A3"
 
-    # ---- Hoja 2: Resumen por placa ----
     ws2 = wb.create_sheet("Resumen Placas")
     ws2["A1"] = "Resumen por Placa"
     ws2["A1"].font = ft_tit; ws2["A1"].fill = fill_tit; ws2["A1"].alignment = centro
@@ -354,7 +345,6 @@ def generar_excel_inspeccion(df: pd.DataFrame) -> bytes:
     for col_l, w in zip(["A","B","C","D","E","F","G"], [14,8,12,14,14,12,12]):
         ws2.column_dimensions[col_l].width = w
 
-    # ---- Hoja 3: Fallas por ítem ----
     ws3 = wb.create_sheet("Fallas por Ítem")
     ws3["A1"] = "Ranking de Fallas por Ítem de Inspección"
     ws3["A1"].font = ft_tit; ws3["A1"].fill = fill_tit; ws3["A1"].alignment = centro
@@ -400,13 +390,12 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # ==================== CONFIGURACIÓN SHEETS ====================
     with st.sidebar:
         st.markdown("### ⚙️ Configuración")
         st.markdown("**Google Sheets**")
         sheet_id   = st.text_input("ID de la hoja",   placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms",
                                    help="El ID está en la URL: docs.google.com/spreadsheets/d/**ID**/edit")
-        sheet_name = st.text_input("Nombre de la pestaña", value="respuestas de formulario 1",
+        sheet_name = st.text_input("Nombre de la pestaña", value="Respuesta de formulario 1",
                                    help="Nombre exacto de la hoja dentro del archivo")
         if st.button("🔄 Recargar datos", type="primary"):
             st.cache_data.clear()
@@ -414,7 +403,6 @@ def main():
         st.divider()
         st.caption("💡 La hoja debe estar compartida como **'Cualquier persona con el enlace puede ver'**")
 
-    # ==================== DEMO MODE ====================
     if not sheet_id:
         st.markdown("""
         <div class="config-box">
@@ -423,14 +411,12 @@ def main():
             2. Click en <b>Compartir</b> → <b>Cualquier persona con el enlace</b> → <b>Lector</b><br>
             3. Copia el ID de la URL: <code>docs.google.com/spreadsheets/d/<b>ESTE-ES-EL-ID</b>/edit</code><br>
             4. Pégalo en el campo <b>ID de la hoja</b> en el panel izquierdo (⚙️)<br>
-            5. Escribe el nombre exacto de tu pestaña (ej: <code>respuestas de formulario 1</code>)
+            5. Escribe el nombre exacto de tu pestaña (ej: <code>Respuesta de formulario 1</code>)
         </div>
         """, unsafe_allow_html=True)
-
         st.info("👈 Configura tu Google Sheets en el panel izquierdo para comenzar.")
         st.stop()
 
-    # ==================== CARGAR DATOS ====================
     with st.spinner("📡 Conectando con Google Sheets..."):
         df_raw = cargar_datos_sheets(sheet_id, sheet_name)
 
@@ -438,7 +424,6 @@ def main():
         st.error("No se pudieron cargar datos. Verifica el ID de la hoja y que esté compartida públicamente.")
         st.stop()
 
-    # ==================== TABS ====================
     tab1, tab2, tab3 = st.tabs(["📋 Historial", "📊 Dashboard", "🔎 Detalle"])
 
     # ===================== TAB 1: HISTORIAL =====================
@@ -472,7 +457,6 @@ def main():
                     estados_disp = ["Todos"]
                 fe = st.selectbox("Estado", estados_disp)
 
-        # Aplicar filtros
         df = df_raw.copy()
         fecha_ref = df.get("fecha", df.get("marca_temporal"))
         if fecha_ref is not None and fecha_ref.notna().any():
@@ -484,7 +468,6 @@ def main():
         if fe != "Todos" and "_estado" in df.columns:
             df = df[df["_estado"] == fe]
 
-        # KPIs
         total = len(df)
         sin_f  = (df["_estado"] == "✅ Sin Fallas").sum()    if "_estado" in df.columns else 0
         men_f  = df["_estado"].str.contains("Menores",  na=False).sum() if "_estado" in df.columns else 0
@@ -500,7 +483,6 @@ def main():
 
         st.divider()
 
-        # Botón descarga
         col_rep, col_btn = st.columns([2, 3])
         with col_rep:
             nombre_rep = st.text_input("Nombre del reporte", value="Inspecciones_Vehiculares")
@@ -518,7 +500,6 @@ def main():
 
         st.divider()
 
-        # Tabla
         cols_tabla = [c for c in ["marca_temporal","fecha","placa","conductor","kilometraje","_estado","_fallas_count","observaciones","hallazgos"] if c in df.columns]
         rename_tabla = {
             "marca_temporal": "Registro", "fecha": "Fecha", "placa": "Placa",
@@ -657,7 +638,6 @@ def main():
             st.warning("No hay datos cargados.")
             st.stop()
 
-        # Selector
         if "placa" in df_raw.columns and "marca_temporal" in df_raw.columns:
             df_raw["_label_sel"] = df_raw.apply(
                 lambda r: f"{str(r.get('marca_temporal',''))[:16]} | {r.get('placa','')} | {r.get('conductor','')} | {r.get('_estado','')}",
@@ -675,7 +655,6 @@ def main():
         if sel:
             row = df_raw[df_raw["_label_sel"] == sel].iloc[0]
 
-            # Info general
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("🚛 Placa",      row.get("placa","—"))
             c2.metric("👤 Conductor",  str(row.get("conductor","—"))[:25])
@@ -688,7 +667,6 @@ def main():
             else:
                 st.success("✅ Inspección aprobada — sin fallas detectadas.")
 
-            # Ítems por grupo
             for grupo, items in GRUPOS_INSPECCION.items():
                 st.markdown(f'<div class="section-title">{grupo}</div>', unsafe_allow_html=True)
                 cols_g = st.columns(3)
@@ -706,7 +684,6 @@ def main():
                         st.markdown(f"**{label}**<br>{badge}", unsafe_allow_html=True)
                         st.write("")
 
-            # Obs y hallazgos
             st.markdown('<div class="section-title">📝 Observaciones y Hallazgos</div>', unsafe_allow_html=True)
             obs_val = str(row.get("observaciones","")).strip()
             hall_val = str(row.get("hallazgos","")).strip()
