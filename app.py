@@ -197,7 +197,6 @@ def es_falla(valor):
 
 
 def normalizar_nombre(nombre):
-    """Normaliza nombre: quita espacios extra, pone Title Case, elimina caracteres raros."""
     if pd.isna(nombre) or str(nombre).strip() == "":
         return ""
     n = str(nombre).strip()
@@ -206,7 +205,6 @@ def normalizar_nombre(nombre):
 
 
 def nombre_clave(nombre):
-    """Clave de agrupación: solo letras minúsculas, sin tildes, sin espacios extra."""
     if not nombre:
         return ""
     n = nombre.lower()
@@ -214,47 +212,28 @@ def nombre_clave(nombre):
         n = n.replace(a, b)
     n = re.sub(r'[^a-z\s]', '', n)
     partes = n.split()
-    # Usar las primeras dos palabras como clave principal (nombre + primer apellido)
     return ' '.join(partes[:2]) if len(partes) >= 2 else ' '.join(partes)
 
 
 def parsear_fecha(serie):
-    """
-    Intenta parsear fechas correctamente manejando formatos DD/MM/YYYY,
-    MM/DD/YYYY, YYYY-MM-DD, timestamps de Google Forms, etc.
-    Retorna una Series de datetime.
-    """
     resultado = pd.Series([pd.NaT] * len(serie), index=serie.index)
-
     for fmt in [
-        "%d/%m/%Y %H:%M:%S",
-        "%d/%m/%Y %H:%M",
-        "%d/%m/%Y",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y %H:%M",
-        "%m/%d/%Y",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-        "%d-%m-%Y",
-        "%Y/%m/%d",
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y",
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%d-%m-%Y", "%Y/%m/%d",
     ]:
         mask = resultado.isna() & serie.notna()
         if not mask.any():
             break
         parsed = pd.to_datetime(serie[mask], format=fmt, errors="coerce")
         resultado[mask] = parsed
-
-    # Fallback general
     mask = resultado.isna() & serie.notna()
     if mask.any():
         parsed = pd.to_datetime(serie[mask], errors="coerce", dayfirst=True)
         resultado[mask] = parsed
-
-    # Sanity check: si el año < 1990 o > 2100, es parse incorrecto → NaT
     bad = resultado.notna() & ((resultado.dt.year < 1990) | (resultado.dt.year > 2100))
     resultado[bad] = pd.NaT
-
     return resultado
 
 
@@ -265,8 +244,6 @@ def cargar_datos_sheets(sheet_id: str, sheet_name: str) -> pd.DataFrame:
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={quote(sheet_name)}"
     try:
         df = pd.read_csv(url)
-
-        # Renombrar columnas
         rename_map = {}
         for short, full in COLS.items():
             for col in df.columns:
@@ -280,22 +257,18 @@ def cargar_datos_sheets(sheet_id: str, sheet_name: str) -> pd.DataFrame:
                         break
         df = df.rename(columns=rename_map)
 
-        # ── Parseo correcto de fechas ──
         for col_fecha in ["marca_temporal", "fecha"]:
             if col_fecha in df.columns:
                 df[col_fecha] = parsear_fecha(df[col_fecha].astype(str).replace("nan", ""))
 
-        # ── Normalizar conductores ──
         if "conductor" in df.columns:
             df["conductor_raw"] = df["conductor"].copy()
             df["conductor"] = df["conductor"].apply(normalizar_nombre)
             df["conductor_clave"] = df["conductor"].apply(nombre_clave)
 
-        # ── Normalizar placas ──
         if "placa" in df.columns:
             df["placa"] = df["placa"].astype(str).str.strip().str.upper()
 
-        # ── Conteo de fallas y estado ──
         item_cols = [k for k in ITEMS_INSPECCION.values() if k in df.columns]
         if item_cols:
             df["_fallas_count"] = df[item_cols].apply(
@@ -312,208 +285,437 @@ def cargar_datos_sheets(sheet_id: str, sheet_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ==================== EXCEL ====================
+# ==================== EXCEL - NUEVO FORMATO ====================
 
-def generar_excel_inspeccion(df: pd.DataFrame) -> bytes:
+def generar_excel_inspeccion(df: pd.DataFrame, titulo_reporte: str = "REPORTE DE INSPECCIONES") -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Inspecciones"
 
-    ft_tit   = Font(name="Calibri", bold=True, size=13, color="FFFFFF")
-    ft_hdr   = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
-    ft_norm  = Font(name="Calibri", size=9)
-    ft_falla = Font(name="Calibri", size=9, color="C0392B", bold=True)
-    ft_ok    = Font(name="Calibri", size=9, color="1E8449")
+    # ── Paleta de colores (igual al reporte ABRIL) ──
+    COLOR_HEADER      = "1F3864"
+    COLOR_VERDE       = "1E8449"
+    COLOR_ROJO        = "C0392B"
+    COLOR_NARANJA     = "E67E22"
+    COLOR_AMARILLO_BG = "F9E79F"
+    COLOR_GRIS        = "F2F2F2"
+    COLOR_VERDE_CLARO = "D5F5E3"
+    COLOR_ROJO_CLARO  = "FADBD8"
+    COLOR_AZUL_CLARO  = "D6E4FF"
+    COLOR_WARN_BG     = "FDEBD0"
 
-    fill_tit   = PatternFill("solid", start_color="0F2027")
-    fill_hdr   = PatternFill("solid", start_color="203A43")
-    fill_alt   = PatternFill("solid", start_color="EBF5FB")
-    fill_falla = PatternFill("solid", start_color="FADBD8")
-    fill_ok    = PatternFill("solid", start_color="D5F5E3")
-    fill_warn  = PatternFill("solid", start_color="FDEBD0")
+    def thin_border():
+        s = Side(style='thin', color='CCCCCC')
+        return Border(left=s, right=s, top=s, bottom=s)
 
-    borde  = Border(left=Side(style="thin"), right=Side(style="thin"),
-                    top=Side(style="thin"),  bottom=Side(style="thin"))
-    centro = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    izq    = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+    def header_cell(ws, row, col, text, bg=COLOR_HEADER, fg="FFFFFF", bold=True, size=10):
+        c = ws.cell(row=row, column=col, value=text)
+        c.font = Font(name='Arial', bold=bold, color=fg, size=size)
+        c.fill = PatternFill('solid', start_color=bg)
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        c.border = thin_border()
+        return c
+
+    def data_cell(ws, row, col, value, bg=None, bold=False, center=True, fmt=None, fg=None):
+        c = ws.cell(row=row, column=col, value=value)
+        c.font = Font(name='Arial', bold=bold, size=9, color=fg if fg else "000000")
+        if bg:
+            c.fill = PatternFill('solid', start_color=bg)
+        c.alignment = Alignment(
+            horizontal='center' if center else 'left',
+            vertical='center', wrap_text=True
+        )
+        c.border = thin_border()
+        if fmt:
+            c.number_format = fmt
+        return c
 
     now_col = datetime.now(BOGOTA_TZ)
 
+    # Determinar columna de fecha disponible
+    fecha_col = "fecha" if ("fecha" in df.columns and df["fecha"].notna().any()) else "marca_temporal"
+
+    # ══════════════════════════════════════════════════════════════
+    # HOJA 1 — RESUMEN POR PLACA  (estilo semáforo del reporte ABRIL)
+    # ══════════════════════════════════════════════════════════════
+    ws1 = wb.active
+    ws1.title = "RESUMEN"
+
+    # Título principal
+    ws1.merge_cells('A1:H1')
+    t = ws1['A1']
+    t.value = f"🔍 {titulo_reporte}   |   {now_col.strftime('%d/%m/%Y %H:%M')} COL   |   {len(df)} registros"
+    t.font = Font(name='Arial', bold=True, color="FFFFFF", size=13)
+    t.fill = PatternFill('solid', start_color=COLOR_HEADER)
+    t.alignment = Alignment(horizontal='center', vertical='center')
+    ws1.row_dimensions[1].height = 32
+
+    # Fila de subtítulo / totales globales
+    total_insp   = len(df)
+    total_placas = df["placa"].nunique() if "placa" in df.columns else 0
+    sin_f   = (df["_estado"] == "✅ Sin Fallas").sum()            if "_estado" in df.columns else 0
+    men_f   = df["_estado"].str.contains("Menores",  na=False).sum() if "_estado" in df.columns else 0
+    crit_f  = df["_estado"].str.contains("Críticas", na=False).sum() if "_estado" in df.columns else 0
+    pct_ok  = round(sin_f / total_insp * 100, 1) if total_insp > 0 else 0
+
+    kpi_data = [
+        ("A2", f"🚛 {total_placas} PLACAS", COLOR_HEADER),
+        ("C2", f"📋 {total_insp} INSPECCIONES", "2980B9"),
+        ("E2", f"✅ {sin_f} SIN FALLAS  ({pct_ok}%)", COLOR_VERDE),
+        ("G2", f"❌ {crit_f} FALLAS CRÍTICAS", COLOR_ROJO),
+    ]
+    ws1.merge_cells('A2:B2')
+    ws1.merge_cells('C2:D2')
+    ws1.merge_cells('E2:F2')
+    ws1.merge_cells('G2:H2')
+    for ref, txt, color in kpi_data:
+        c = ws1[ref]
+        c.value = txt
+        c.font = Font(name='Arial', bold=True, color="FFFFFF", size=10)
+        c.fill = PatternFill('solid', start_color=color)
+        c.alignment = Alignment(horizontal='center', vertical='center')
+        c.border = thin_border()
+    ws1.row_dimensions[2].height = 24
+    ws1.row_dimensions[3].height = 6
+
+    # Encabezados tabla
+    hdrs = ['PLACA', 'TOTAL DÍAS', 'SI HIZO ✓', 'NO HIZO ✗', '% CUMPLIMIENTO', 'FALLAS TOTAL', '# CRÍTICAS', 'ESTADO']
+    for ci, h in enumerate(hdrs, 1):
+        header_cell(ws1, 4, ci, h)
+    ws1.row_dimensions[4].height = 28
+
+    # Calcular resumen por placa
+    if "placa" in df.columns and "_estado" in df.columns:
+        resumen_rows = []
+        for placa_v, g in df.groupby("placa"):
+            tot       = len(g)
+            si_hizo   = (g["_estado"] == "✅ Sin Fallas").sum()
+            no_hizo   = tot - si_hizo
+            pct_placa = round(si_hizo / tot * 100, 1) if tot > 0 else 0
+            fallas_t  = int(g["_fallas_count"].sum()) if "_fallas_count" in g.columns else 0
+            criticas  = g["_estado"].str.contains("Críticas", na=False).sum()
+            resumen_rows.append((placa_v, tot, si_hizo, no_hizo, pct_placa, fallas_t, criticas))
+        resumen_rows.sort(key=lambda x: x[2], reverse=True)
+
+        for idx, (placa_v, tot, si, no, pct, fall, crit) in enumerate(resumen_rows):
+            r = idx + 5
+            if pct >= 70:
+                estado_txt = "✅ BUENO"
+                estado_bg  = COLOR_VERDE_CLARO
+                estado_fg  = COLOR_VERDE
+            elif pct >= 30:
+                estado_txt = "⚠️ REGULAR"
+                estado_bg  = COLOR_AMARILLO_BG
+                estado_fg  = COLOR_NARANJA
+            else:
+                estado_txt = "❌ CRÍTICO"
+                estado_bg  = COLOR_ROJO_CLARO
+                estado_fg  = COLOR_ROJO
+
+            data_cell(ws1, r, 1, placa_v,  bold=True)
+            data_cell(ws1, r, 2, tot)
+            data_cell(ws1, r, 3, int(si),  bg=COLOR_VERDE_CLARO if si > 0 else None)
+            data_cell(ws1, r, 4, int(no),  bg=COLOR_ROJO_CLARO  if no > tot * 0.6 else None)
+            c_pct = data_cell(ws1, r, 5, pct / 100, fmt='0.0%', bold=True)
+            c_pct.font = Font(name='Arial', bold=True, size=9, color=estado_fg)
+            data_cell(ws1, r, 6, fall)
+            data_cell(ws1, r, 7, int(crit), bg=COLOR_ROJO_CLARO if crit > 0 else None)
+            data_cell(ws1, r, 8, estado_txt, bg=estado_bg, bold=True, fg=estado_fg)
+            ws1.row_dimensions[r].height = 20
+
+    for i, w in enumerate([12, 12, 12, 12, 16, 14, 12, 14], 1):
+        ws1.column_dimensions[get_column_letter(i)].width = w
+
+    # ══════════════════════════════════════════════════════════════
+    # HOJA 2 — MAPA DE INSPECCIONES POR PLACA Y FECHA
+    # (igual al "Mapa de Calor" del reporte ABRIL)
+    # ══════════════════════════════════════════════════════════════
+    ws2 = wb.create_sheet("MAPA DE INSPECCIONES")
+
+    if fecha_col in df.columns and "placa" in df.columns:
+        fechas_unicas = sorted(df[fecha_col].dropna().dt.date.unique())
+        placas_unicas = sorted(df["placa"].dropna().unique())
+
+        n_cols_map = len(fechas_unicas) + 2  # placa + fechas + total
+        ws2.merge_cells(f'A1:{get_column_letter(n_cols_map)}1')
+        t2 = ws2['A1']
+        t2.value = "MAPA DE INSPECCIONES POR PLACA Y FECHA"
+        t2.font = Font(name='Arial', bold=True, color="FFFFFF", size=13)
+        t2.fill = PatternFill('solid', start_color=COLOR_HEADER)
+        t2.alignment = Alignment(horizontal='center', vertical='center')
+        ws2.row_dimensions[1].height = 30
+
+        # Encabezado: PLACA | fechas... | TOTAL
+        header_cell(ws2, 2, 1, 'PLACA')
+        for ci, fd in enumerate(fechas_unicas, 2):
+            dia_es = DIAS_ES.get(pd.Timestamp(fd).strftime('%A'), '')
+            header_cell(ws2, 2, ci, f"{pd.Timestamp(fd).strftime('%d/%m')}\n{dia_es}", size=9)
+        header_cell(ws2, 2, len(fechas_unicas) + 2, 'TOTAL\nSI HIZO', bg=COLOR_VERDE, size=9)
+        ws2.row_dimensions[2].height = 30
+
+        # Datos
+        for ri, placa in enumerate(placas_unicas, 3):
+            c = ws2.cell(row=ri, column=1, value=placa)
+            c.font = Font(name='Arial', bold=True, size=9)
+            c.fill = PatternFill('solid', start_color=COLOR_GRIS)
+            c.alignment = Alignment(horizontal='center', vertical='center')
+            c.border = thin_border()
+
+            si_count = 0
+            for ci, fd in enumerate(fechas_unicas, 2):
+                # Buscar si hay inspección de esta placa en esta fecha
+                mask = (
+                    (df["placa"] == placa) &
+                    (df[fecha_col].dt.date == fd)
+                )
+                matches = df[mask]
+                if len(matches) > 0:
+                    estado_row = str(matches.iloc[0].get("_estado", ""))
+                    if "Sin Fallas" in estado_row:
+                        val, bg, fg = "✓", COLOR_VERDE_CLARO, COLOR_VERDE
+                        si_count += 1
+                    elif "Menores" in estado_row:
+                        val, bg, fg = "✓⚠", COLOR_AMARILLO_BG, COLOR_NARANJA
+                        si_count += 1
+                    else:
+                        val, bg, fg = "✗", COLOR_ROJO_CLARO, COLOR_ROJO
+                else:
+                    val, bg, fg = "—", COLOR_GRIS, "999999"
+
+                cell = ws2.cell(row=ri, column=ci, value=val)
+                cell.font = Font(name='Arial', bold=True, color=fg, size=11)
+                cell.fill = PatternFill('solid', start_color=bg)
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                cell.border = thin_border()
+
+            # Columna TOTAL
+            tot_col = len(fechas_unicas) + 2
+            c_tot = ws2.cell(row=ri, column=tot_col, value=si_count)
+            pct_map = round(si_count / len(fechas_unicas) * 100) if fechas_unicas else 0
+            c_tot.value = f"{si_count}/{len(fechas_unicas)}\n{pct_map}%"
+            if pct_map >= 70:
+                c_tot.fill = PatternFill('solid', start_color=COLOR_VERDE_CLARO)
+                c_tot.font = Font(name='Arial', bold=True, size=9, color=COLOR_VERDE)
+            elif pct_map >= 30:
+                c_tot.fill = PatternFill('solid', start_color=COLOR_AMARILLO_BG)
+                c_tot.font = Font(name='Arial', bold=True, size=9, color=COLOR_NARANJA)
+            else:
+                c_tot.fill = PatternFill('solid', start_color=COLOR_ROJO_CLARO)
+                c_tot.font = Font(name='Arial', bold=True, size=9, color=COLOR_ROJO)
+            c_tot.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            c_tot.border = thin_border()
+            ws2.row_dimensions[ri].height = 20
+
+        ws2.column_dimensions['A'].width = 12
+        for i in range(2, len(fechas_unicas) + 2):
+            ws2.column_dimensions[get_column_letter(i)].width = 9
+        ws2.column_dimensions[get_column_letter(len(fechas_unicas) + 2)].width = 11
+
+        # Leyenda
+        ley_row = len(placas_unicas) + 4
+        ws2.cell(row=ley_row, column=1, value="LEYENDA:").font = Font(bold=True, name='Arial', size=9)
+        items_ley = [
+            ('✓  INSPECCIONÓ (sin fallas)', COLOR_VERDE_CLARO, COLOR_VERDE),
+            ('✓⚠ INSPECCIONÓ (fallas menores)', COLOR_AMARILLO_BG, COLOR_NARANJA),
+            ('✗  NO INSPECCIONÓ', COLOR_ROJO_CLARO, COLOR_ROJO),
+            ('—  Sin registro', COLOR_GRIS, "999999"),
+        ]
+        for ii, (txt, bg, fg) in enumerate(items_ley, 2):
+            c = ws2.cell(row=ley_row, column=ii, value=txt)
+            c.font = Font(name='Arial', bold=True, color=fg, size=9)
+            c.fill = PatternFill('solid', start_color=bg)
+            c.alignment = Alignment(horizontal='center')
+            c.border = thin_border()
+            ws2.column_dimensions[get_column_letter(ii)].width = max(
+                ws2.column_dimensions[get_column_letter(ii)].width, 22
+            )
+
+    # ══════════════════════════════════════════════════════════════
+    # HOJA 3 — DETALLE DE INSPECCIONES (registro completo)
+    # ══════════════════════════════════════════════════════════════
+    ws3 = wb.create_sheet("DETALLE")
+
     cols_export = [
-        ("marca_temporal", "FECHA REGISTRO", 20),
         ("fecha",          "FECHA",          14),
-        ("dia_semana",     "DÍA",            10),
         ("placa",          "PLACA",          12),
-        ("conductor",      "CONDUCTOR",      30),
-        ("documento",      "DOCUMENTO",      14),
+        ("conductor",      "CONDUCTOR",      28),
         ("kilometraje",    "KM",             10),
         ("_estado",        "ESTADO",         18),
         ("_fallas_count",  "# FALLAS",       10),
         ("observaciones",  "OBSERVACIONES",  35),
         ("hallazgos",      "HALLAZGOS",      35),
         ("contaminacion",  "CONTAMINACIÓN",  22),
-        ("en_taller",      "EN TALLER",      12),
         ("firma_supervisor","SUPERVISOR",    22),
     ]
     for label, short in ITEMS_INSPECCION.items():
         cols_export.append((short, label.upper(), 20))
 
-    n_cols = len(cols_export)
-    ws.merge_cells(f"A1:{get_column_letter(n_cols)}1")
-    ws["A1"] = f"🔍 REPORTE DE INSPECCIONES VEHICULARES  |  {now_col.strftime('%d/%m/%Y %H:%M')} COL  |  {len(df)} registros"
-    ws["A1"].font = ft_tit; ws["A1"].fill = fill_tit; ws["A1"].alignment = centro
-    ws.row_dimensions[1].height = 28
+    n_cols3 = len(cols_export)
+    ws3.merge_cells(f'A1:{get_column_letter(n_cols3)}1')
+    t3 = ws3['A1']
+    t3.value = f"DETALLE COMPLETO DE INSPECCIONES — {titulo_reporte}"
+    t3.font = Font(name='Arial', bold=True, color="FFFFFF", size=12)
+    t3.fill = PatternFill('solid', start_color=COLOR_HEADER)
+    t3.alignment = Alignment(horizontal='center', vertical='center')
+    ws3.row_dimensions[1].height = 28
 
     for ci, (_, nombre, ancho) in enumerate(cols_export, 1):
-        c = ws.cell(2, ci, nombre)
-        c.font = ft_hdr; c.fill = fill_hdr; c.alignment = centro; c.border = borde
-        ws.column_dimensions[get_column_letter(ci)].width = ancho
-    ws.row_dimensions[2].height = 28
+        header_cell(ws3, 2, ci, nombre, size=9)
+        ws3.column_dimensions[get_column_letter(ci)].width = ancho
+    ws3.row_dimensions[2].height = 26
 
-    for ri, (_, row) in enumerate(df.iterrows(), 3):
+    df_sorted = df.copy()
+    if fecha_col in df_sorted.columns:
+        df_sorted = df_sorted.sort_values([fecha_col, "placa"], na_position="last")
+
+    for ri, (_, row) in enumerate(df_sorted.iterrows(), 3):
         estado = str(row.get("_estado", ""))
         es_crit = "Críticas" in estado
-        es_warn = "Menores" in estado
+        es_warn = "Menores"  in estado
 
         for ci, (short, _, _) in enumerate(cols_export, 1):
             val = row.get(short, "")
-            if pd.isna(val): val = ""
-            if hasattr(val, "strftime"): val = val.strftime("%d/%m/%Y %H:%M")
-            c = ws.cell(ri, ci, str(val) if val != "" else "")
-            c.border = borde
-            c.alignment = centro if ci in (1,2,3,4,8,9,13) else izq
+            if pd.isna(val):
+                val = ""
+            if hasattr(val, "strftime"):
+                val = val.strftime("%d/%m/%Y")
 
+            c = ws3.cell(ri, ci, str(val) if val != "" else "")
+            c.border = thin_border()
+            c.alignment = Alignment(
+                horizontal='center' if ci <= 6 else 'left',
+                vertical='center', wrap_text=True
+            )
+            c.font = Font(name='Arial', size=9)
+
+            # Color de fondo según estado
             if short in ITEMS_INSPECCION.values() and es_falla(val):
-                c.font = ft_falla; c.fill = fill_falla
-            elif es_crit:
-                c.font = ft_falla if ci == 8 else ft_norm
-                if ci == 8: c.fill = fill_falla
-                elif ri % 2 == 0: c.fill = fill_alt
-            elif es_warn:
-                c.font = ft_norm
-                if ci == 8: c.fill = fill_warn
-                elif ri % 2 == 0: c.fill = fill_alt
-            else:
-                c.font = ft_ok if ci == 8 else ft_norm
-                if ci == 8: c.fill = fill_ok
-                elif ri % 2 == 0: c.fill = fill_alt
+                c.fill = PatternFill('solid', start_color=COLOR_ROJO_CLARO)
+                c.font = Font(name='Arial', size=9, color=COLOR_ROJO, bold=True)
+            elif ci == 5:  # columna ESTADO
+                if es_crit:
+                    c.fill = PatternFill('solid', start_color=COLOR_ROJO_CLARO)
+                    c.font = Font(name='Arial', size=9, color=COLOR_ROJO, bold=True)
+                elif es_warn:
+                    c.fill = PatternFill('solid', start_color=COLOR_AMARILLO_BG)
+                    c.font = Font(name='Arial', size=9, color=COLOR_NARANJA, bold=True)
+                else:
+                    c.fill = PatternFill('solid', start_color=COLOR_VERDE_CLARO)
+                    c.font = Font(name='Arial', size=9, color=COLOR_VERDE, bold=True)
+            elif ri % 2 == 0:
+                c.fill = PatternFill('solid', start_color="EBF5FB")
 
-        ws.row_dimensions[ri].height = 16
+        ws3.row_dimensions[ri].height = 16
 
-    ws.freeze_panes = "A3"
+    ws3.freeze_panes = "A3"
 
-    # ── Hoja 2: Resumen Placas ──
-    ws2 = wb.create_sheet("Resumen Placas")
-    ws2["A1"] = "Resumen por Placa"
-    ws2["A1"].font = ft_tit; ws2["A1"].fill = fill_tit; ws2["A1"].alignment = centro
-    ws2.row_dimensions[1].height = 26
+    # ══════════════════════════════════════════════════════════════
+    # HOJA 4 — FALLAS POR ÍTEM (ranking)
+    # ══════════════════════════════════════════════════════════════
+    ws4 = wb.create_sheet("FALLAS POR ÍTEM")
 
-    hdrs2 = ["PLACA", "TOTAL", "SIN FALLAS", "FALLAS MENORES", "FALLAS CRÍTICAS", "% APROBADO", "PROM. KM"]
-    for ci, h in enumerate(hdrs2, 1):
-        c = ws2.cell(2, ci, h); c.font = ft_hdr; c.fill = fill_hdr
-        c.alignment = centro; c.border = borde
-    ws2.row_dimensions[2].height = 22
+    ws4.merge_cells('A1:D1')
+    t4 = ws4['A1']
+    t4.value = "RANKING DE FALLAS POR ÍTEM DE INSPECCIÓN"
+    t4.font = Font(name='Arial', bold=True, color="FFFFFF", size=12)
+    t4.fill = PatternFill('solid', start_color=COLOR_HEADER)
+    t4.alignment = Alignment(horizontal='center', vertical='center')
+    ws4.row_dimensions[1].height = 28
 
-    if "placa" in df.columns and "_estado" in df.columns:
-        gr = df.groupby("placa")
-        resumen_rows = []
-        for placa_v, g in gr:
-            tot = len(g)
-            sin = (g["_estado"] == "✅ Sin Fallas").sum()
-            men = g["_estado"].str.contains("Menores", na=False).sum()
-            cri = g["_estado"].str.contains("Críticas", na=False).sum()
-            pct = f"{round((sin+men)/tot*100,1)}%" if tot > 0 else "0%"
-            km_vals = pd.to_numeric(g.get("kilometraje", pd.Series()), errors="coerce").dropna()
-            prom_km = f"{int(km_vals.mean()):,}" if len(km_vals) > 0 else "—"
-            resumen_rows.append((placa_v, tot, sin, men, cri, pct, prom_km))
-        resumen_rows.sort(key=lambda x: x[1], reverse=True)
-        for ri, vals in enumerate(resumen_rows, 3):
-            fill_r = PatternFill("solid", start_color="EBF5FB") if ri % 2 == 0 else None
-            for ci, v in enumerate(vals, 1):
-                c = ws2.cell(ri, ci, v); c.font = ft_norm; c.border = borde
-                c.alignment = izq if ci == 1 else centro
-                if fill_r: c.fill = fill_r
-
-    for col_l, w in zip(["A","B","C","D","E","F","G"], [14,8,12,14,14,12,12]):
-        ws2.column_dimensions[col_l].width = w
-
-    # ── Hoja 3: Fallas por Ítem ──
-    ws3 = wb.create_sheet("Fallas por Ítem")
-    ws3["A1"] = "Ranking de Fallas por Ítem de Inspección"
-    ws3["A1"].font = ft_tit; ws3["A1"].fill = fill_tit; ws3["A1"].alignment = centro
-    ws3.row_dimensions[1].height = 26
-
-    hdrs3 = ["ÍTEM DE INSPECCIÓN", "TOTAL FALLAS", "% DEL TOTAL"]
-    for ci, h in enumerate(hdrs3, 1):
-        c = ws3.cell(2, ci, h); c.font = ft_hdr; c.fill = fill_hdr
-        c.alignment = centro; c.border = borde
-    ws3.row_dimensions[2].height = 22
+    hdrs4 = ['ÍTEM DE INSPECCIÓN', 'TOTAL FALLAS', '% DEL TOTAL', 'INDICADOR']
+    for ci, h in enumerate(hdrs4, 1):
+        header_cell(ws4, 2, ci, h)
+    ws4.row_dimensions[2].height = 26
 
     fallas_items = []
     for label, short in ITEMS_INSPECCION.items():
         if short in df.columns:
-            cnt = df[short].apply(es_falla).sum()
-            fallas_items.append((label, int(cnt)))
+            cnt = int(df[short].apply(es_falla).sum())
+            fallas_items.append((label, cnt))
     fallas_items.sort(key=lambda x: x[1], reverse=True)
     total_fallas_all = sum(x[1] for x in fallas_items) or 1
 
     for ri, (label, cnt) in enumerate(fallas_items, 3):
-        pct_str = f"{round(cnt/total_fallas_all*100,1)}%"
-        fill_r = fill_falla if cnt > 0 else (fill_alt if ri % 2 == 0 else None)
-        for ci, v in enumerate([label, cnt, pct_str], 1):
-            c = ws3.cell(ri, ci, v); c.border = borde
-            c.font = ft_falla if cnt > 0 else ft_norm
-            c.alignment = izq if ci == 1 else centro
-            if fill_r: c.fill = fill_r
+        pct_v = round(cnt / total_fallas_all * 100, 1)
+        bg = COLOR_ROJO_CLARO if cnt > 0 else ("EBF5FB" if ri % 2 == 0 else None)
+        fg = COLOR_ROJO if cnt > 0 else "000000"
+        data_cell(ws4, ri, 1, label,   bg=bg, center=False, fg=fg, bold=(cnt > 0))
+        data_cell(ws4, ri, 2, cnt,     bg=bg, fg=fg, bold=(cnt > 0))
+        data_cell(ws4, ri, 3, pct_v / 100, bg=bg, fg=fg, fmt='0.0%')
+        # Barra visual de texto
+        barras = int(pct_v / 5)
+        barra_txt = "█" * barras + "░" * (20 - barras)
+        c_bar = ws4.cell(ri, 4, barra_txt)
+        c_bar.font = Font(name='Courier New', size=8, color=COLOR_ROJO if cnt > 0 else "BBBBBB")
+        c_bar.border = thin_border()
+        c_bar.alignment = Alignment(horizontal='left', vertical='center')
+        ws4.row_dimensions[ri].height = 18
 
-    for col_l, w in zip(["A","B","C"], [40, 14, 12]):
-        ws3.column_dimensions[col_l].width = w
+    for col_l, w in zip(["A","B","C","D"], [38, 14, 12, 24]):
+        ws4.column_dimensions[col_l].width = w
 
-    # ── Hoja 4: Reporte Conductores ──
-    ws4 = wb.create_sheet("Reporte Conductores")
-    ws4["A1"] = "Reporte de Inspecciones por Conductor y Placa"
-    ws4["A1"].font = ft_tit; ws4["A1"].fill = fill_tit; ws4["A1"].alignment = centro
-    ws4.row_dimensions[1].height = 26
+    # ══════════════════════════════════════════════════════════════
+    # HOJA 5 — REPORTE CONDUCTORES
+    # ══════════════════════════════════════════════════════════════
+    ws5 = wb.create_sheet("CONDUCTORES")
 
-    hdrs4 = ["CONDUCTOR", "PLACA", "FECHA", "DÍA", "ESTADO", "# FALLAS", "OBSERVACIONES"]
-    for ci, h in enumerate(hdrs4, 1):
-        c = ws4.cell(2, ci, h); c.font = ft_hdr; c.fill = fill_hdr
-        c.alignment = centro; c.border = borde
-    ws4.row_dimensions[2].height = 22
+    ws5.merge_cells('A1:G1')
+    t5 = ws5['A1']
+    t5.value = "REPORTE DE INSPECCIONES POR CONDUCTOR"
+    t5.font = Font(name='Arial', bold=True, color="FFFFFF", size=12)
+    t5.fill = PatternFill('solid', start_color=COLOR_HEADER)
+    t5.alignment = Alignment(horizontal='center', vertical='center')
+    ws5.row_dimensions[1].height = 28
 
-    cols4_needed = ["conductor","placa","fecha","marca_temporal","_estado","_fallas_count","observaciones"]
-    df4 = df[[c for c in cols4_needed if c in df.columns]].copy()
-    fecha_col4 = "fecha" if "fecha" in df4.columns else "marca_temporal"
-    if fecha_col4 in df4.columns:
-        df4 = df4.sort_values([fecha_col4, "conductor"], na_position="last")
+    hdrs5 = ["CONDUCTOR", "PLACA", "FECHA", "DÍA", "ESTADO", "# FALLAS", "OBSERVACIONES"]
+    for ci, h in enumerate(hdrs5, 1):
+        header_cell(ws5, 2, ci, h)
+    ws5.row_dimensions[2].height = 26
 
-    for ri, (_, row) in enumerate(df4.iterrows(), 3):
-        fv = row.get(fecha_col4, "")
-        fecha_str = fv.strftime("%d/%m/%Y") if hasattr(fv, "strftime") and not pd.isna(fv) else str(fv)
-        dia_str = DIAS_ES.get(fv.strftime("%A"), fv.strftime("%A")) if hasattr(fv, "strftime") and not pd.isna(fv) else ""
-        vals4 = [
+    cols5 = ["conductor", "placa", fecha_col, "_estado", "_fallas_count", "observaciones"]
+    df5 = df[[c for c in cols5 if c in df.columns]].copy()
+    if fecha_col in df5.columns:
+        df5 = df5.sort_values([fecha_col, "conductor"], na_position="last")
+
+    for ri, (_, row) in enumerate(df5.iterrows(), 3):
+        fv       = row.get(fecha_col, "")
+        fecha_s  = fv.strftime("%d/%m/%Y") if hasattr(fv, "strftime") and not pd.isna(fv) else str(fv)
+        dia_s    = DIAS_ES.get(fv.strftime("%A"), "") if hasattr(fv, "strftime") and not pd.isna(fv) else ""
+        estado_v = str(row.get("_estado", ""))
+        vals5    = [
             str(row.get("conductor","")).strip() or "—",
             str(row.get("placa","")).strip() or "—",
-            fecha_str,
-            dia_str,
-            str(row.get("_estado","")) or "—",
+            fecha_s, dia_s, estado_v,
             int(row.get("_fallas_count", 0)) if not pd.isna(row.get("_fallas_count", 0)) else 0,
             str(row.get("observaciones","")).strip() or "",
         ]
-        estado_v = str(row.get("_estado",""))
-        fill_r = fill_falla if "Críticas" in estado_v else (fill_warn if "Menores" in estado_v else (fill_ok if "Sin" in estado_v else None))
-        for ci, v in enumerate(vals4, 1):
-            c = ws4.cell(ri, ci, v); c.border = borde
-            c.alignment = izq; c.font = ft_norm
-            if fill_r: c.fill = fill_r
-        ws4.row_dimensions[ri].height = 16
+        if "Críticas" in estado_v:
+            row_bg = COLOR_ROJO_CLARO
+        elif "Menores" in estado_v:
+            row_bg = COLOR_WARN_BG
+        elif "Sin" in estado_v:
+            row_bg = COLOR_VERDE_CLARO
+        else:
+            row_bg = "EBF5FB" if ri % 2 == 0 else None
+
+        for ci, v in enumerate(vals5, 1):
+            c = ws5.cell(ri, ci, v)
+            c.border = thin_border()
+            c.font = Font(name='Arial', size=9)
+            c.alignment = Alignment(
+                horizontal='left' if ci in (1, 7) else 'center',
+                vertical='center', wrap_text=True
+            )
+            if row_bg:
+                c.fill = PatternFill('solid', start_color=row_bg)
+        ws5.row_dimensions[ri].height = 16
 
     for col_l, w in zip(["A","B","C","D","E","F","G"], [30,12,14,12,18,10,45]):
-        ws4.column_dimensions[col_l].width = w
+        ws5.column_dimensions[col_l].width = w
+
+    ws5.freeze_panes = "A3"
 
     output = io.BytesIO()
     wb.save(output)
@@ -529,7 +731,6 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # Botón de recarga en sidebar (sin necesidad de configurar nada)
     with st.sidebar:
         st.markdown("### ⚙️ Opciones")
         if st.button("🔄 Recargar datos", type="primary"):
@@ -552,7 +753,6 @@ def main():
     with tab1:
         st.markdown("### 📋 Historial de Inspecciones")
 
-        # Determinar columna de fecha disponible
         fecha_col_name = "fecha" if ("fecha" in df_raw.columns and df_raw["fecha"].notna().any()) else "marca_temporal"
         fechas_validas = df_raw[fecha_col_name].dropna() if fecha_col_name in df_raw.columns else pd.Series([], dtype="datetime64[ns]")
 
@@ -566,7 +766,6 @@ def main():
                 f_max = fechas_validas.max().date() if len(fechas_validas) > 0 else datetime.now().date()
                 ff = st.date_input("Hasta", f_max, key="h_ff")
             with fc3:
-                # Opciones de conductor: "Todos" + lista de "Nombre (PLACA1, PLACA2)"
                 if "conductor" in df_raw.columns and "placa" in df_raw.columns:
                     cond_placa = (
                         df_raw[df_raw["conductor"].notna() & (df_raw["conductor"] != "")]
@@ -591,7 +790,6 @@ def main():
                 estados_disp = ["Todos", "✅ Sin Fallas", "⚠️ Fallas Menores", "❌ Fallas Críticas"] if "_estado" in df_raw.columns else ["Todos"]
                 fe = st.selectbox("Estado", estados_disp)
 
-        # Aplicar filtros
         df = df_raw.copy()
         if fecha_col_name in df.columns and fechas_validas.notna().any():
             df = df[df[fecha_col_name].dt.date.between(fi, ff)]
@@ -624,7 +822,15 @@ def main():
         with col_btn:
             st.markdown("<br>", unsafe_allow_html=True)
             if total > 0:
-                excel_data = generar_excel_inspeccion(df)
+                # Construir título con rango de fechas
+                if fecha_col_name in df.columns and df[fecha_col_name].notna().any():
+                    fd_min = df[fecha_col_name].min().strftime("%d/%m/%Y")
+                    fd_max = df[fecha_col_name].max().strftime("%d/%m/%Y")
+                    titulo_excel = f"INSPECCIONES VEHICULARES  {fd_min} — {fd_max}"
+                else:
+                    titulo_excel = "INSPECCIONES VEHICULARES"
+
+                excel_data = generar_excel_inspeccion(df, titulo_reporte=titulo_excel)
                 st.download_button(
                     "⬇️ Descargar Excel completo",
                     data=excel_data,
@@ -635,7 +841,6 @@ def main():
 
         st.divider()
 
-        # Tabla con fecha bien formateada
         cols_tabla = [c for c in [fecha_col_name, "placa", "conductor", "kilometraje", "_estado", "_fallas_count", "observaciones", "hallazgos"] if c in df.columns]
         rename_tabla = {
             "marca_temporal": "Registro", "fecha": "Fecha", "placa": "Placa",
@@ -645,7 +850,6 @@ def main():
         }
         if not df.empty:
             df_show = df[cols_tabla].rename(columns=rename_tabla).copy()
-            # Formatear fecha para visualización
             fecha_col_show = "Registro" if "marca_temporal" in cols_tabla else "Fecha"
             if fecha_col_show in df_show.columns:
                 df_show[fecha_col_show] = df_show[fecha_col_show].apply(
@@ -666,7 +870,6 @@ def main():
             df_dash = df_raw.copy()
             fecha_col_dash = "fecha" if ("fecha" in df_dash.columns and df_dash["fecha"].notna().any()) else "marca_temporal"
 
-            # ── Fila 1: Estado y por día ──
             g1, g2 = st.columns(2)
 
             with g1:
@@ -698,7 +901,6 @@ def main():
 
             st.divider()
 
-            # ── Fila 2: Fallas por ítem y por placa ──
             g3, g4 = st.columns(2)
 
             with g3:
@@ -736,7 +938,6 @@ def main():
 
             st.divider()
 
-            # ── Fila 3: Día de semana y ranking conductores ──
             g5, g6 = st.columns(2)
 
             with g5:
@@ -770,16 +971,11 @@ def main():
 
             st.divider()
 
-            # ══════════════════════════════════════════════════════
-            # ── NUEVO: Reporte Mensual de Conductores ──
-            # ══════════════════════════════════════════════════════
+            # ── Reporte Mensual de Conductores ──
             st.markdown("---")
             st.markdown("## 👥 Reporte Mensual de Conductores")
-            st.caption("Quién hizo inspección, con qué placa, en qué fecha y sus observaciones.")
 
             if "conductor" in df_dash.columns and fecha_col_dash in df_dash.columns:
-
-                # Selector de mes/año
                 meses_disponibles = (
                     df_dash[fecha_col_dash]
                     .dropna()
@@ -802,11 +998,10 @@ def main():
                     if df_mes.empty:
                         st.info("No hay inspecciones en este mes.")
                     else:
-                        # KPIs del mes
-                        tot_mes   = len(df_mes)
-                        cond_unicos = df_mes["conductor"].nunique()
-                        placas_unicas = df_mes["placa"].nunique() if "placa" in df_mes.columns else 0
-                        dias_con_insp = df_mes[fecha_col_dash].dt.date.nunique()
+                        tot_mes         = len(df_mes)
+                        cond_unicos     = df_mes["conductor"].nunique()
+                        placas_unicas   = df_mes["placa"].nunique() if "placa" in df_mes.columns else 0
+                        dias_con_insp   = df_mes[fecha_col_dash].dt.date.nunique()
 
                         km1, km2, km3, km4 = st.columns(4)
                         km1.metric("📋 Inspecciones del mes", tot_mes)
@@ -815,8 +1010,6 @@ def main():
                         km4.metric("📅 Días con actividad",   dias_con_insp)
 
                         st.markdown("---")
-
-                        # ── Tabla detalle: conductor × día × placa ──
                         st.markdown("#### 📋 Detalle por Conductor — Día y Placa")
 
                         cols_detalle = [c for c in [fecha_col_dash,"conductor","placa","_estado","_fallas_count","observaciones","hallazgos"] if c in df_mes.columns]
@@ -827,7 +1020,6 @@ def main():
                         df_det["_dia_semana"] = df_det[fecha_col_dash].apply(
                             lambda x: DIAS_ES.get(x.strftime("%A"), x.strftime("%A")) if hasattr(x,"strftime") and not pd.isna(x) else ""
                         )
-
                         df_tabla_det = df_det[[
                             "conductor","placa","_fecha_fmt","_dia_semana","_estado","_fallas_count","observaciones"
                         ] if "observaciones" in df_det.columns else [
@@ -841,12 +1033,9 @@ def main():
                             "_fallas_count":  "# Fallas",
                             "observaciones":  "Observaciones",
                         }).sort_values(["Conductor","Fecha"])
-
                         st.dataframe(df_tabla_det, use_container_width=True, hide_index=True)
 
                         st.markdown("---")
-
-                        # ── Resumen agrupado por conductor ──
                         st.markdown("#### 🧑 Resumen por Conductor")
 
                         grp = df_mes.groupby("conductor", dropna=False)
@@ -863,17 +1052,17 @@ def main():
                             sin_f_c = (g["_estado"] == "✅ Sin Fallas").sum()     if "_estado" in g.columns else 0
                             men_c   = g["_estado"].str.contains("Menores",na=False).sum() if "_estado" in g.columns else 0
                             crit_c  = g["_estado"].str.contains("Críticas",na=False).sum() if "_estado" in g.columns else 0
-                            obs_vals = g["observaciones"].dropna().astype(str).tolist() if "observaciones" in g.columns else []
+                            obs_vals  = g["observaciones"].dropna().astype(str).tolist() if "observaciones" in g.columns else []
                             obs_clean = [o for o in obs_vals if o.strip() and o.strip().lower() != "nan"]
                             resumen_cond.append({
-                                "Conductor":      cond_nombre,
-                                "Placas":         " · ".join(placas_usadas) if placas_usadas else "—",
+                                "Conductor":          cond_nombre,
+                                "Placas":             " · ".join(placas_usadas) if placas_usadas else "—",
                                 "Días inspeccionados": dias_str if dias_str else "—",
-                                "Total":          len(g),
-                                "Sin Fallas":     int(sin_f_c),
-                                "Fallas Menores": int(men_c),
-                                "Fallas Críticas":int(crit_c),
-                                "Observaciones":  " | ".join(obs_clean) if obs_clean else "",
+                                "Total":              len(g),
+                                "Sin Fallas":         int(sin_f_c),
+                                "Fallas Menores":     int(men_c),
+                                "Fallas Críticas":    int(crit_c),
+                                "Observaciones":      " | ".join(obs_clean) if obs_clean else "",
                             })
 
                         if resumen_cond:
@@ -881,16 +1070,14 @@ def main():
                             st.dataframe(df_res_cond, use_container_width=True, hide_index=True)
 
                         st.markdown("---")
-
-                        # ── Gráfico: inspecciones por conductor en el mes ──
                         st.markdown("#### 📊 Inspecciones por Conductor en el Mes")
                         if resumen_cond:
                             df_bar_cond = pd.DataFrame(resumen_cond)[["Conductor","Total","Sin Fallas","Fallas Menores","Fallas Críticas"]]
                             df_bar_cond = df_bar_cond.sort_values("Total", ascending=True)
                             fig_cond = go.Figure()
-                            fig_cond.add_trace(go.Bar(name="Sin Fallas",      x=df_bar_cond["Sin Fallas"],     y=df_bar_cond["Conductor"], orientation="h", marker_color="#27ae60"))
-                            fig_cond.add_trace(go.Bar(name="Fallas Menores",   x=df_bar_cond["Fallas Menores"], y=df_bar_cond["Conductor"], orientation="h", marker_color="#f39c12"))
-                            fig_cond.add_trace(go.Bar(name="Fallas Críticas",  x=df_bar_cond["Fallas Críticas"],y=df_bar_cond["Conductor"], orientation="h", marker_color="#e74c3c"))
+                            fig_cond.add_trace(go.Bar(name="Sin Fallas",      x=df_bar_cond["Sin Fallas"],      y=df_bar_cond["Conductor"], orientation="h", marker_color="#27ae60"))
+                            fig_cond.add_trace(go.Bar(name="Fallas Menores",   x=df_bar_cond["Fallas Menores"],  y=df_bar_cond["Conductor"], orientation="h", marker_color="#f39c12"))
+                            fig_cond.add_trace(go.Bar(name="Fallas Críticas",  x=df_bar_cond["Fallas Críticas"], y=df_bar_cond["Conductor"], orientation="h", marker_color="#e74c3c"))
                             fig_cond.update_layout(
                                 barmode="stack",
                                 height=max(300, len(df_bar_cond)*40),
@@ -901,9 +1088,10 @@ def main():
                             )
                             st.plotly_chart(fig_cond, use_container_width=True)
 
-                        # ── Descarga Excel del mes ──
                         st.markdown("---")
-                        excel_mes = generar_excel_inspeccion(df_mes)
+                        # Excel del mes con el nuevo formato
+                        titulo_mes = f"INSPECCIONES — {mes_sel_label.upper()}"
+                        excel_mes = generar_excel_inspeccion(df_mes, titulo_reporte=titulo_mes)
                         st.download_button(
                             f"⬇️ Descargar Excel — {mes_sel_label}",
                             data=excel_mes,
