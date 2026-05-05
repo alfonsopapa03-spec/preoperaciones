@@ -1,721 +1,654 @@
 import streamlit as st
+import psycopg2
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
 import io
-import re
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 import pytz
-from urllib.parse import quote
 
-# ==================== CONFIG ====================
+# ==================== CONFIGURACIÓN ====================
 st.set_page_config(
-    page_title="Inspecciones Vehiculares",
+    page_title="Inspección Preoperacional",
     layout="wide",
-    page_icon="🔍",
+    page_icon="🔧",
     initial_sidebar_state="collapsed"
 )
 
-BOGOTA_TZ = pytz.timezone("America/Bogota")
+# ==================== CREDENCIALES ====================
+SUPABASE_DB_URL = "postgresql://postgres.scjqqcrkjdavetdyxtrf:DN-3QM7ty9Y4LsT@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
 
-# ==================== HARDCODED SHEET CONFIG ====================
-SHEET_ID   = "1Y9L1NGfUpb79k672ZV8eq9M0MrZABzWdE_SfnFiBOi4"
-SHEET_NAME = "Respuestas de formulario 1"
+# ==================== CATÁLOGO DE MÁQUINAS ====================
+# ⚙️ CAMBIA AQUÍ LOS NOMBRES REALES DE TUS 11 MÁQUINAS
+MAQUINAS = [
+    "Máquina 01",
+    "Máquina 02",
+    "Máquina 03",
+    "Máquina 04",
+    "Máquina 05",
+    "Máquina 06",
+    "Máquina 07",
+    "Máquina 08",
+    "Máquina 09",
+    "Máquina 10",
+    "Máquina 11",
+]
+
+# ==================== OPERADORES ====================
+# ⚙️ CAMBIA AQUÍ LOS NOMBRES DE TUS OPERADORES
+OPERADORES = sorted([
+    "Operador 01",
+    "Operador 02",
+    "Operador 03",
+    "Operador 04",
+    "Operador 05",
+])
+
+REVISORES = sorted([
+    "Supervisor 01",
+    "Supervisor 02",
+    "Supervisor 03",
+])
+
+# ==================== CHECKLIST — ITEMS POR SECCIÓN ====================
+CHECKLIST = {
+    "ANTES DE SU USO": [
+        "¿Ha sido capacitado el trabajador para utilizar la máquina?",
+        "¿Tiene permiso el trabajador para utilizar la máquina?",
+        "¿Se ha verificado que la presión del aire se encuentre en 125 PSI?",
+        "¿Se ha verificado que los desenrolladores contengan material?",
+        "¿Se ha inspeccionado que los electro/válvulas funcionen adecuadamente?",
+        "¿Se ha comprobado que los ganchos de ajuste funcionen?",
+        "¿El 'carro' de tracción del material funciona satisfactoriamente?",
+        "¿Se ha verificado que el tape se encuentre en óptimas condiciones?",
+        "¿Se ha inspeccionado que las palancas de emergencias (6 en total) funcionen correctamente?",
+        "¿Se ha verificado el estado de los cabezales (inferior/superior)?",
+        "¿El nivel de lubricación se encontrará en nivel correspondiente?",
+        "¿El manómetro de aire se encuentra funcionando correctamente?",
+        "¿El nivel de aceite del líquido refrigerante se encontrará en nivel adecuado?",
+        "¿Se ha ajustado la altura del panel a medida correspondiente?",
+    ],
+    "INSPECCIÓN DEL LUGAR DE TRABAJO": [
+        "¿Se ha inspeccionado el lugar de trabajo? (material combustible, riesgo de incendios, instalaciones, otros trabajadores, etc.)",
+        "¿La iluminación del área de trabajo es adecuada para operación de la máquina sin riesgos?",
+        "¿Se ha inspeccionado que el área esté limpia y libre de obstáculos?",
+    ],
+    "ELEMENTOS DE PROTECCIÓN PERSONAL (EPP)": [
+        "¿Cuenta con los elementos de protección personal? (protector de ojos, oídos, guantes y calzado)",
+        "¿El trabajador está vestido apropiadamente? (Camisa manga larga, pantalón de dotación y calzado de seguridad)",
+        "¿Se evidencia el NO uso de joyas, relojes y ropa holgada?",
+    ],
+    "SEGURIDAD ELÉCTRICA": [
+        "¿Se tiene el cabello recogido si lo tiene largo?",
+        "¿Se ha verificado que el cable de alimentación esté en buen estado?",
+        "¿Se ha revisado que el enchufe se encuentre en buenas condiciones?",
+        "¿El interruptor de encendido funciona correctamente?",
+    ],
+}
+
+TODAS_PREGUNTAS = []
+for seccion, preguntas in CHECKLIST.items():
+    for p in preguntas:
+        TODAS_PREGUNTAS.append((seccion, p))
 
 # ==================== CSS ====================
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700&family=Barlow:wght@300;400;500&display=swap');
-html, body, [class*="css"] { font-family: 'Barlow', sans-serif; }
-.main-header {
-    background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
-    padding: 1.5rem 2rem; border-radius: 12px; margin-bottom: 1.5rem;
-}
-.main-header h1 {
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 2rem; font-weight: 700; color: white; margin: 0; letter-spacing: 1px;
-}
-.main-header p { color: #a0c4d8; margin: 0.3rem 0 0 0; font-size: 0.9rem; }
+    @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Noto+Sans:wght@300;400;500&display=swap');
 
-.kpi-card {
-    background: white; border-radius: 10px; padding: 1rem 1.2rem;
-    border-left: 5px solid #2c5364; box-shadow: 0 2px 8px rgba(0,0,0,0.07);
-    margin-bottom: 0.5rem;
-}
-.kpi-card.verde  { border-left-color: #27ae60; }
-.kpi-card.rojo   { border-left-color: #e74c3c; }
-.kpi-card.ambar  { border-left-color: #f39c12; }
-.kpi-card.azul   { border-left-color: #2980b9; }
-.kpi-val { font-size: 2rem; font-weight: 700; color: #0f2027; }
-.kpi-lbl { font-size: 0.78rem; color: #666; text-transform: uppercase; letter-spacing: 1px; }
+    html, body, [class*="css"] {
+        font-family: 'Noto Sans', sans-serif;
+    }
 
-.badge-ok    { background:#d5f5e3; color:#1e8449; padding:2px 10px; border-radius:12px; font-size:0.82rem; font-weight:600; }
-.badge-falla { background:#fadbd8; color:#922b21; padding:2px 10px; border-radius:12px; font-size:0.82rem; font-weight:600; }
-.badge-na    { background:#eaecee; color:#566573; padding:2px 10px; border-radius:12px; font-size:0.82rem; font-weight:600; }
+    .main-header {
+        background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 50%, #16213e 100%);
+        padding: 1.8rem 2.5rem;
+        border-radius: 14px;
+        margin-bottom: 1.5rem;
+        border: 1px solid #0f3460;
+        position: relative;
+        overflow: hidden;
+    }
+    .main-header::before {
+        content: '';
+        position: absolute;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background: repeating-linear-gradient(
+            45deg,
+            transparent,
+            transparent 10px,
+            rgba(255,165,0,0.02) 10px,
+            rgba(255,165,0,0.02) 11px
+        );
+    }
+    .main-header h1 {
+        font-family: 'Rajdhani', sans-serif;
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #ffffff;
+        margin: 0;
+        letter-spacing: 3px;
+        text-transform: uppercase;
+    }
+    .main-header .accent { color: #f5a623; }
+    .main-header p { color: #8899aa; margin: 0.3rem 0 0; font-size: 0.85rem; letter-spacing: 1px; }
 
-.section-title {
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 1.15rem; font-weight: 700; color: #203a43;
-    border-bottom: 2px solid #2c5364; padding-bottom: 4px; margin: 1.2rem 0 0.6rem 0;
-}
+    .seccion-header {
+        background: linear-gradient(90deg, #0f3460, #16213e);
+        color: #f5a623;
+        font-family: 'Rajdhani', sans-serif;
+        font-size: 1rem;
+        font-weight: 700;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+        padding: 0.6rem 1.2rem;
+        border-radius: 6px;
+        border-left: 4px solid #f5a623;
+        margin: 1rem 0 0.5rem;
+    }
 
-.conductor-card {
-    background: white; border-radius: 10px; padding: 0.9rem 1.1rem;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-bottom: 0.5rem;
-    border-left: 5px solid #27ae60;
-}
-.conductor-card.no-insp { border-left-color: #e74c3c; background: #fff9f9; }
-.conductor-card.parcial { border-left-color: #f39c12; }
+    .item-pregunta {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 0.7rem 1rem;
+        margin-bottom: 0.4rem;
+        font-size: 0.88rem;
+        color: #2d3748;
+        line-height: 1.4;
+    }
+
+    .badge-cumple {
+        background: #d4edda; color: #155724;
+        padding: 2px 8px; border-radius: 12px;
+        font-size: 0.75rem; font-weight: 600;
+    }
+    .badge-nocumple {
+        background: #f8d7da; color: #721c24;
+        padding: 2px 8px; border-radius: 12px;
+        font-size: 0.75rem; font-weight: 600;
+    }
+    .badge-na {
+        background: #e2e3e5; color: #383d41;
+        padding: 2px 8px; border-radius: 12px;
+        font-size: 0.75rem; font-weight: 600;
+    }
+
+    .kpi-card {
+        background: white;
+        border-radius: 10px;
+        padding: 1rem 1.2rem;
+        border-left: 5px solid #f5a623;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+        margin-bottom: 0.5rem;
+    }
+    .kpi-val { font-size: 2rem; font-weight: 700; color: #0a0a0a; font-family: 'Rajdhani', sans-serif; }
+    .kpi-lbl { font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 1px; }
+
+    .alerta-nc {
+        background: #fff5f5;
+        border: 1px solid #fc8181;
+        border-left: 4px solid #e53e3e;
+        border-radius: 8px;
+        padding: 0.8rem 1rem;
+        margin: 0.5rem 0;
+        font-size: 0.85rem;
+        color: #742a2a;
+    }
+
+    div[data-testid="stTabs"] button {
+        font-family: 'Rajdhani', sans-serif;
+        font-weight: 600;
+        font-size: 1rem;
+        letter-spacing: 1px;
+    }
+
+    .resultado-cumple {
+        background: linear-gradient(135deg, #d4edda, #c3e6cb);
+        border: 1px solid #28a745;
+        border-radius: 10px;
+        padding: 1rem;
+        text-align: center;
+        font-family: 'Rajdhani', sans-serif;
+        font-size: 1.5rem;
+        color: #155724;
+        font-weight: 700;
+    }
+    .resultado-nc {
+        background: linear-gradient(135deg, #f8d7da, #f5c6cb);
+        border: 1px solid #dc3545;
+        border-radius: 10px;
+        padding: 1rem;
+        text-align: center;
+        font-family: 'Rajdhani', sans-serif;
+        font-size: 1.5rem;
+        color: #721c24;
+        font-weight: 700;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== MAPEO DE COLUMNAS ====================
-COLS = {
-    "marca_temporal":       "Marca temporal",
-    "fecha":                "FECHA: ",
-    "dia_semana":           "DIA DE LA SEMANA",
-    "placa":                "PLACA DEL VEHICULO:",
-    "conductor":            "NOMBRE Y APELLIDOS DEL CONDUCTOR:",
-    "documento":            "DOCUMENTO IDENTIDAD:",
-    "kilometraje":          "KILOMETRAJE:",
-    "salud_conductor":      "1. ESTADO DE LA SALUD DEL CONDUCTOR (¿Está en condiciones de salud y descanso para usar el vehículo (sin malestar, mareos, fiebre, sueño u otros síntomas)?)",
-    "luces":                "2. ESTADO DE LAS LUCES (Luces Medias, altas, bajas, direccionales, de parqueo, de frenos, reversa, interiores, y de tablero).",
-    "liquidos":             "3. NIVELES Y PÉRDIDAS DE LÍQUIDOS (Nivel de Aceite de motor, hidráulico, de transmisión, de agua del radiador y del limpiabrisas, A.C.P.M.)  ",
-    "frenos":               "4. ESTADO DE FRENOS, FUGAS Y FILTROS (Estado de frenos, frenos de emergencia y frenos del tráiler).",
-    "baterias":             "5. FUNCIONAMIENTO DE LAS BATERIAS (Estado de las baterías).",
-    "tablero":              "6. TABLERO DE CONTROL - Estado del (Medidor del nivel de combustible, odómetro, pito, tacómetro, velocímetro, indicador de aceite y temperatura).",
-    "cabina_seguridad":     "7.1 Cinturones de Seguridad, estado y anclaje de la silla/cojinería, chasis, carrocería, pito y puertas. ",
-    "cabina_interior":      "7.2. ESTADO DE LA CABINA (interior pisos y techos, sección de pasajeros)",
-    "parachoques":          "7.3 ESTADO DEL PARACHOQUES O DEFENSA",
-    "tanque":               "7.4 ESTADO DEL TANQUE DEL COMBUSTIBLE Y DEL AGUA",
-    "espejos":              "8. ESPEJOS RETROVISORES (Limpieza y posición de los espejos laterales). ",
-    "direccion":            "9.1 Estado de la Dirección (rótulas, terminales, ballestas).",
-    "suspension":           "9.2. Estado de la Suspensión (hojas de muelles, amortiguadores, resortes, bombonas,  delantera - trasera)",
-    "vidrios":              "10. ESTADO DE LOS VIDRIOS (Panorámico y trasero)",
-    "limpiaparabrisas":     "11. LIMPIAPARABRISAS - Estado del limpiaparabrisas (derecho e izquierdo)",
-    "llantas_cabezote":     "12.1 Llantas del cabezote",
-    "llantas_trailer":      "12.2 Llantas del Tráiler",
-    "llanta_repuesto":      "12.3 Llanta de Repuesto",
-    "electrico":            "13.1 Instalaciones eléctricas (cabezote y/o Tráiler, encendido del vehículo)",
-    "embrague":             "13.2 Estado de Embrague / Clutch",
-    "transmision":          "13.3 Estado de la transmisión de velocidades",
-    "acelerador":           "13.4 Estado del acelerador",
-    "exosto":               "13.5 Exosto",
-    "pitos_reversa":        "13.6 Pitos de Reversa (cabezote y tráiler)",
-    "placas":               "13.7 Placas (tráiler y cabezote)",
-    "pisos_falsos":         "13.8 Existen pisos y/o techos falsos ",
-    "pata_mecanica":        "13.9 Pata mecánica del tráiler",
-    "quinta_rueda":         "13.10 Estado del área de la quinta rueda",
-    "kingpin":              "13.11 Kingpin ",
-    "documentos":           "13.12 Documentos (soat, tecnomecánica y Tarjeta de Propiedad) ",
-    "equipo_carretera":     "14.1. Verifique el contenido y estado del equipo de carretera (gato  con capacidad para elevar el vehículo, llave de tacón, tacos, conos, extintor, linterna, chaleco reflectivo, botiquín)",
-    "caja_herramientas":    "14.2 Caja de herramientas (alicates, destornilladores de pala y estrella, llave de expansión y fijas)",
-    "equipos_carga":        "15.1 Equipos para asegurar la carga (Cadenas, monas, Malacates, Cinchas, Pines, Madera, Trompos / Twist lock).",
-    "carpa":                "15.2 Estado de la carpa (si aplica)",
-    "generador":            "15.3 Estado del generador para carga refrigerada (Si aplica)",
-    "observaciones":        "OBSERVACIONES GENERALES:",
-    "firma_supervisor":     "FIRMA DEL SUPERVISOR",
-    "placa_tercero":        "SI USTED ES UN TERCERO, ESCRIBA SU PLACA A CONTINUACIÓN",
-    "contaminacion":        "13.13. ¿Durante la inspección ha identificado sustancias o productos no autorizados, o alguna situación inusual o condición que pueda resultar sospechosa de contaminación?",
-    "foto_evidencia":       "Foto de evidencia",
-    "hallazgos":            "HALLAZGOS (Si evidencia daños importantes adjuntar foto) Maximo 5 fotos",
-    "en_taller":            "Antes de contestar las siguientes preguntas confirme si el vehículo se encuentra en el taller:",
-}
+# ==================== BASE DE DATOS ====================
+class DB:
+    def __init__(self):
+        self.url = SUPABASE_DB_URL
+        self.init()
 
-ITEMS_INSPECCION = {
-    "Salud Conductor":    "salud_conductor",
-    "Luces":              "luces",
-    "Líquidos":           "liquidos",
-    "Frenos":             "frenos",
-    "Baterías":           "baterias",
-    "Tablero Control":    "tablero",
-    "Cabina Seguridad":   "cabina_seguridad",
-    "Cabina Interior":    "cabina_interior",
-    "Parachoques":        "parachoques",
-    "Tanque":             "tanque",
-    "Espejos":            "espejos",
-    "Dirección":          "direccion",
-    "Suspensión":         "suspension",
-    "Vidrios":            "vidrios",
-    "Limpiaparabrisas":   "limpiaparabrisas",
-    "Llantas Cabezote":   "llantas_cabezote",
-    "Llantas Tráiler":    "llantas_trailer",
-    "Llanta Repuesto":    "llanta_repuesto",
-    "Eléctrico":          "electrico",
-    "Embrague":           "embrague",
-    "Transmisión":        "transmision",
-    "Acelerador":         "acelerador",
-    "Exosto":             "exosto",
-    "Pitos Reversa":      "pitos_reversa",
-    "Placas":             "placas",
-    "Pata Mecánica":      "pata_mecanica",
-    "Quinta Rueda":       "quinta_rueda",
-    "Kingpin":            "kingpin",
-    "Documentos":         "documentos",
-    "Equipo Carretera":   "equipo_carretera",
-    "Caja Herramientas":  "caja_herramientas",
-    "Equipos Carga":      "equipos_carga",
-}
+    def conn(self):
+        return psycopg2.connect(self.url)
 
-GRUPOS_INSPECCION = {
-    "🧑 Conductor":           ["salud_conductor"],
-    "💡 Luces y Tablero":     ["luces", "tablero"],
-    "🔧 Mecánica":            ["liquidos", "frenos", "baterias", "embrague", "transmision", "acelerador", "exosto", "electrico"],
-    "🚗 Cabina y Carrocería": ["cabina_seguridad", "cabina_interior", "parachoques", "tanque", "espejos", "vidrios", "limpiaparabrisas"],
-    "⚙️ Chasis y Tren":       ["direccion", "suspension", "llantas_cabezote", "llantas_trailer", "llanta_repuesto", "pata_mecanica", "quinta_rueda", "kingpin"],
-    "📋 Documentos y Equipo": ["placas", "documentos", "equipo_carretera", "caja_herramientas", "equipos_carga"],
-}
-
-DIAS_ES = {
-    "Monday": "Lunes", "Tuesday": "Martes", "Wednesday": "Miércoles",
-    "Thursday": "Jueves", "Friday": "Viernes", "Saturday": "Sábado", "Sunday": "Domingo"
-}
-
-MESES_ES = {
-    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
-    5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
-    9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"
-}
-
-# ==================== HELPERS ====================
-
-def es_falla(valor):
-    if pd.isna(valor) or str(valor).strip() == "":
-        return False
-    v = str(valor).strip().upper()
-    keywords_falla = ["MAL", "FALLA", "DEFICIENTE", "DAÑA", "ROTO", "NO FUNCIONA",
-                      "REGULAR", "DETERIORA", "REQUIERE", "URGENTE", "NO TIENE",
-                      "INCOMPLETO", "VENCIDO", "NO", "MALO"]
-    keywords_ok = ["BIEN", "OK", "BUENO", "EXCELENTE", "NORMAL", "COMPLETO",
-                   "VIGENTE", "FUNCIONA", "SÍ", "SI", "CORRECTO", "BUEN"]
-    for k in keywords_falla:
-        if k in v:
-            return True
-    for k in keywords_ok:
-        if k in v:
-            return False
-    return False
-
-
-def normalizar_nombre(nombre):
-    if pd.isna(nombre) or str(nombre).strip() == "":
-        return ""
-    n = str(nombre).strip()
-    n = re.sub(r'\s+', ' ', n)
-    return n.title()
-
-
-def nombre_clave(nombre):
-    if not nombre:
-        return ""
-    n = nombre.lower()
-    for a, b in [('á','a'),('é','e'),('í','i'),('ó','o'),('ú','u'),('ñ','n')]:
-        n = n.replace(a, b)
-    n = re.sub(r'[^a-z\s]', '', n)
-    partes = n.split()
-    return ' '.join(partes[:2]) if len(partes) >= 2 else ' '.join(partes)
-
-
-def parsear_fecha(serie):
-    resultado = pd.Series([pd.NaT] * len(serie), index=serie.index)
-    for fmt in [
-        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
-        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y",
-        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-        "%d-%m-%Y", "%Y/%m/%d",
-    ]:
-        mask = resultado.isna() & serie.notna()
-        if not mask.any():
-            break
-        parsed = pd.to_datetime(serie[mask], format=fmt, errors="coerce")
-        resultado[mask] = parsed
-    mask = resultado.isna() & serie.notna()
-    if mask.any():
-        parsed = pd.to_datetime(serie[mask], errors="coerce", dayfirst=True)
-        resultado[mask] = parsed
-    bad = resultado.notna() & ((resultado.dt.year < 1990) | (resultado.dt.year > 2100))
-    resultado[bad] = pd.NaT
-    return resultado
-
-
-# ==================== CARGA DE DATOS ====================
-
-@st.cache_data(ttl=300, show_spinner=False)
-def cargar_datos_sheets(sheet_id: str, sheet_name: str) -> pd.DataFrame:
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={quote(sheet_name)}"
-    try:
-        df = pd.read_csv(url)
-        rename_map = {}
-        for short, full in COLS.items():
-            for col in df.columns:
-                if col.strip().lower() == full.strip().lower():
-                    rename_map[col] = short
-                    break
-            if short not in rename_map.values():
-                for col in df.columns:
-                    if full.strip()[:30].lower() in col.strip().lower():
-                        rename_map[col] = short
-                        break
-        df = df.rename(columns=rename_map)
-
-        for col_fecha in ["marca_temporal", "fecha"]:
-            if col_fecha in df.columns:
-                df[col_fecha] = parsear_fecha(df[col_fecha].astype(str).replace("nan", ""))
-
-        if "conductor" in df.columns:
-            df["conductor_raw"] = df["conductor"].copy()
-            df["conductor"] = df["conductor"].apply(normalizar_nombre)
-            df["conductor_clave"] = df["conductor"].apply(nombre_clave)
-
-        if "placa" in df.columns:
-            df["placa"] = df["placa"].astype(str).str.strip().str.upper()
-
-        item_cols = [k for k in ITEMS_INSPECCION.values() if k in df.columns]
-        if item_cols:
-            df["_fallas_count"] = df[item_cols].apply(
-                lambda row: sum(es_falla(v) for v in row), axis=1
-            )
-            df["_estado"] = df["_fallas_count"].apply(
-                lambda n: "✅ Sin Fallas" if n == 0 else ("⚠️ Fallas Menores" if n <= 3 else "❌ Fallas Críticas")
-            )
-
-        return df
-
-    except Exception as e:
-        st.error(f"Error al cargar Google Sheets: {e}")
-        return pd.DataFrame()
-
-
-# ==================== EXCEL - NUEVO FORMATO ====================
-
-def generar_excel_inspeccion(df: pd.DataFrame, titulo_reporte: str = "REPORTE DE INSPECCIONES") -> bytes:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-
-    wb = Workbook()
-
-    # ── Paleta de colores (igual al reporte ABRIL) ──
-    COLOR_HEADER      = "1F3864"
-    COLOR_VERDE       = "1E8449"
-    COLOR_ROJO        = "C0392B"
-    COLOR_NARANJA     = "E67E22"
-    COLOR_AMARILLO_BG = "F9E79F"
-    COLOR_GRIS        = "F2F2F2"
-    COLOR_VERDE_CLARO = "D5F5E3"
-    COLOR_ROJO_CLARO  = "FADBD8"
-    COLOR_AZUL_CLARO  = "D6E4FF"
-    COLOR_WARN_BG     = "FDEBD0"
-
-    def thin_border():
-        s = Side(style='thin', color='CCCCCC')
-        return Border(left=s, right=s, top=s, bottom=s)
-
-    def header_cell(ws, row, col, text, bg=COLOR_HEADER, fg="FFFFFF", bold=True, size=10):
-        c = ws.cell(row=row, column=col, value=text)
-        c.font = Font(name='Arial', bold=bold, color=fg, size=size)
-        c.fill = PatternFill('solid', start_color=bg)
-        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        c.border = thin_border()
-        return c
-
-    def data_cell(ws, row, col, value, bg=None, bold=False, center=True, fmt=None, fg=None):
-        c = ws.cell(row=row, column=col, value=value)
-        c.font = Font(name='Arial', bold=bold, size=9, color=fg if fg else "000000")
-        if bg:
-            c.fill = PatternFill('solid', start_color=bg)
-        c.alignment = Alignment(
-            horizontal='center' if center else 'left',
-            vertical='center', wrap_text=True
-        )
-        c.border = thin_border()
-        if fmt:
-            c.number_format = fmt
-        return c
-
-    now_col = datetime.now(BOGOTA_TZ)
-
-    # Determinar columna de fecha disponible
-    fecha_col = "fecha" if ("fecha" in df.columns and df["fecha"].notna().any()) else "marca_temporal"
-
-    # ══════════════════════════════════════════════════════════════
-    # HOJA 1 — RESUMEN POR PLACA  (estilo semáforo del reporte ABRIL)
-    # ══════════════════════════════════════════════════════════════
-    ws1 = wb.active
-    ws1.title = "RESUMEN"
-
-    # Título principal
-    ws1.merge_cells('A1:H1')
-    t = ws1['A1']
-    t.value = f"🔍 {titulo_reporte}   |   {now_col.strftime('%d/%m/%Y %H:%M')} COL   |   {len(df)} registros"
-    t.font = Font(name='Arial', bold=True, color="FFFFFF", size=13)
-    t.fill = PatternFill('solid', start_color=COLOR_HEADER)
-    t.alignment = Alignment(horizontal='center', vertical='center')
-    ws1.row_dimensions[1].height = 32
-
-    # Fila de subtítulo / totales globales
-    total_insp   = len(df)
-    total_placas = df["placa"].nunique() if "placa" in df.columns else 0
-    sin_f   = (df["_estado"] == "✅ Sin Fallas").sum()            if "_estado" in df.columns else 0
-    men_f   = df["_estado"].str.contains("Menores",  na=False).sum() if "_estado" in df.columns else 0
-    crit_f  = df["_estado"].str.contains("Críticas", na=False).sum() if "_estado" in df.columns else 0
-    pct_ok  = round(sin_f / total_insp * 100, 1) if total_insp > 0 else 0
-
-    kpi_data = [
-        ("A2", f"🚛 {total_placas} PLACAS", COLOR_HEADER),
-        ("C2", f"📋 {total_insp} INSPECCIONES", "2980B9"),
-        ("E2", f"✅ {sin_f} SIN FALLAS  ({pct_ok}%)", COLOR_VERDE),
-        ("G2", f"❌ {crit_f} FALLAS CRÍTICAS", COLOR_ROJO),
-    ]
-    ws1.merge_cells('A2:B2')
-    ws1.merge_cells('C2:D2')
-    ws1.merge_cells('E2:F2')
-    ws1.merge_cells('G2:H2')
-    for ref, txt, color in kpi_data:
-        c = ws1[ref]
-        c.value = txt
-        c.font = Font(name='Arial', bold=True, color="FFFFFF", size=10)
-        c.fill = PatternFill('solid', start_color=color)
-        c.alignment = Alignment(horizontal='center', vertical='center')
-        c.border = thin_border()
-    ws1.row_dimensions[2].height = 24
-    ws1.row_dimensions[3].height = 6
-
-    # Encabezados tabla
-    hdrs = ['PLACA', 'TOTAL DÍAS', 'SI HIZO ✓', 'NO HIZO ✗', '% CUMPLIMIENTO', 'FALLAS TOTAL', '# CRÍTICAS', 'ESTADO']
-    for ci, h in enumerate(hdrs, 1):
-        header_cell(ws1, 4, ci, h)
-    ws1.row_dimensions[4].height = 28
-
-    # Calcular resumen por placa
-    if "placa" in df.columns and "_estado" in df.columns:
-        resumen_rows = []
-        for placa_v, g in df.groupby("placa"):
-            tot       = len(g)
-            si_hizo   = (g["_estado"] == "✅ Sin Fallas").sum()
-            no_hizo   = tot - si_hizo
-            pct_placa = round(si_hizo / tot * 100, 1) if tot > 0 else 0
-            fallas_t  = int(g["_fallas_count"].sum()) if "_fallas_count" in g.columns else 0
-            criticas  = g["_estado"].str.contains("Críticas", na=False).sum()
-            resumen_rows.append((placa_v, tot, si_hizo, no_hizo, pct_placa, fallas_t, criticas))
-        resumen_rows.sort(key=lambda x: x[2], reverse=True)
-
-        for idx, (placa_v, tot, si, no, pct, fall, crit) in enumerate(resumen_rows):
-            r = idx + 5
-            if pct >= 70:
-                estado_txt = "✅ BUENO"
-                estado_bg  = COLOR_VERDE_CLARO
-                estado_fg  = COLOR_VERDE
-            elif pct >= 30:
-                estado_txt = "⚠️ REGULAR"
-                estado_bg  = COLOR_AMARILLO_BG
-                estado_fg  = COLOR_NARANJA
-            else:
-                estado_txt = "❌ CRÍTICO"
-                estado_bg  = COLOR_ROJO_CLARO
-                estado_fg  = COLOR_ROJO
-
-            data_cell(ws1, r, 1, placa_v,  bold=True)
-            data_cell(ws1, r, 2, tot)
-            data_cell(ws1, r, 3, int(si),  bg=COLOR_VERDE_CLARO if si > 0 else None)
-            data_cell(ws1, r, 4, int(no),  bg=COLOR_ROJO_CLARO  if no > tot * 0.6 else None)
-            c_pct = data_cell(ws1, r, 5, pct / 100, fmt='0.0%', bold=True)
-            c_pct.font = Font(name='Arial', bold=True, size=9, color=estado_fg)
-            data_cell(ws1, r, 6, fall)
-            data_cell(ws1, r, 7, int(crit), bg=COLOR_ROJO_CLARO if crit > 0 else None)
-            data_cell(ws1, r, 8, estado_txt, bg=estado_bg, bold=True, fg=estado_fg)
-            ws1.row_dimensions[r].height = 20
-
-    for i, w in enumerate([12, 12, 12, 12, 16, 14, 12, 14], 1):
-        ws1.column_dimensions[get_column_letter(i)].width = w
-
-    # ══════════════════════════════════════════════════════════════
-    # HOJA 2 — MAPA DE INSPECCIONES POR PLACA Y FECHA
-    # (igual al "Mapa de Calor" del reporte ABRIL)
-    # ══════════════════════════════════════════════════════════════
-    ws2 = wb.create_sheet("MAPA DE INSPECCIONES")
-
-    if fecha_col in df.columns and "placa" in df.columns:
-        fechas_unicas = sorted(df[fecha_col].dropna().dt.date.unique())
-        placas_unicas = sorted(df["placa"].dropna().unique())
-
-        n_cols_map = len(fechas_unicas) + 2  # placa + fechas + total
-        ws2.merge_cells(f'A1:{get_column_letter(n_cols_map)}1')
-        t2 = ws2['A1']
-        t2.value = "MAPA DE INSPECCIONES POR PLACA Y FECHA"
-        t2.font = Font(name='Arial', bold=True, color="FFFFFF", size=13)
-        t2.fill = PatternFill('solid', start_color=COLOR_HEADER)
-        t2.alignment = Alignment(horizontal='center', vertical='center')
-        ws2.row_dimensions[1].height = 30
-
-        # Encabezado: PLACA | fechas... | TOTAL
-        header_cell(ws2, 2, 1, 'PLACA')
-        for ci, fd in enumerate(fechas_unicas, 2):
-            dia_es = DIAS_ES.get(pd.Timestamp(fd).strftime('%A'), '')
-            header_cell(ws2, 2, ci, f"{pd.Timestamp(fd).strftime('%d/%m')}\n{dia_es}", size=9)
-        header_cell(ws2, 2, len(fechas_unicas) + 2, 'TOTAL\nSI HIZO', bg=COLOR_VERDE, size=9)
-        ws2.row_dimensions[2].height = 30
-
-        # Datos
-        for ri, placa in enumerate(placas_unicas, 3):
-            c = ws2.cell(row=ri, column=1, value=placa)
-            c.font = Font(name='Arial', bold=True, size=9)
-            c.fill = PatternFill('solid', start_color=COLOR_GRIS)
-            c.alignment = Alignment(horizontal='center', vertical='center')
-            c.border = thin_border()
-
-            si_count = 0
-            for ci, fd in enumerate(fechas_unicas, 2):
-                # Buscar si hay inspección de esta placa en esta fecha
-                mask = (
-                    (df["placa"] == placa) &
-                    (df[fecha_col].dt.date == fd)
+    def init(self):
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            # Tabla principal de inspecciones
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS inspecciones_preoperacionales (
+                    id SERIAL PRIMARY KEY,
+                    fecha_registro TIMESTAMP DEFAULT (now() AT TIME ZONE 'America/Bogota'),
+                    fecha DATE NOT NULL,
+                    maquina TEXT NOT NULL,
+                    modelo TEXT,
+                    marca TEXT,
+                    placa TEXT,
+                    operador TEXT,
+                    revisor TEXT,
+                    cliente_proyecto TEXT,
+                    responsable_mantenimiento TEXT,
+                    observaciones TEXT,
+                    total_items INTEGER DEFAULT 0,
+                    items_cumple INTEGER DEFAULT 0,
+                    items_no_cumple INTEGER DEFAULT 0,
+                    items_na INTEGER DEFAULT 0,
+                    porcentaje_cumplimiento NUMERIC(5,2) DEFAULT 0
                 )
-                matches = df[mask]
-                if len(matches) > 0:
-                    estado_row = str(matches.iloc[0].get("_estado", ""))
-                    if "Sin Fallas" in estado_row:
-                        val, bg, fg = "✓", COLOR_VERDE_CLARO, COLOR_VERDE
-                        si_count += 1
-                    elif "Menores" in estado_row:
-                        val, bg, fg = "✓⚠", COLOR_AMARILLO_BG, COLOR_NARANJA
-                        si_count += 1
-                    else:
-                        val, bg, fg = "✗", COLOR_ROJO_CLARO, COLOR_ROJO
-                else:
-                    val, bg, fg = "—", COLOR_GRIS, "999999"
+            """)
+            # Tabla de respuestas por ítem
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS inspecciones_items (
+                    id SERIAL PRIMARY KEY,
+                    inspeccion_id INTEGER REFERENCES inspecciones_preoperacionales(id) ON DELETE CASCADE,
+                    seccion TEXT NOT NULL,
+                    pregunta TEXT NOT NULL,
+                    respuesta TEXT NOT NULL,
+                    observacion_item TEXT
+                )
+            """)
+            c.commit()
+            c.close()
+        except Exception as e:
+            st.error(f"Error DB init: {e}")
 
-                cell = ws2.cell(row=ri, column=ci, value=val)
-                cell.font = Font(name='Arial', bold=True, color=fg, size=11)
-                cell.fill = PatternFill('solid', start_color=bg)
-                cell.alignment = Alignment(horizontal='center', vertical='center')
-                cell.border = thin_border()
+    def guardar_inspeccion(self, datos: dict, items: list) -> bool:
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute("""
+                INSERT INTO inspecciones_preoperacionales
+                (fecha, maquina, modelo, marca, placa, operador, revisor,
+                 cliente_proyecto, responsable_mantenimiento, observaciones,
+                 total_items, items_cumple, items_no_cumple, items_na, porcentaje_cumplimiento)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
+            """, (
+                datos["fecha"], datos["maquina"], datos["modelo"], datos["marca"],
+                datos["placa"], datos["operador"], datos["revisor"],
+                datos["cliente_proyecto"], datos["responsable_mantenimiento"],
+                datos["observaciones"],
+                datos["total_items"], datos["items_cumple"],
+                datos["items_no_cumple"], datos["items_na"],
+                datos["porcentaje_cumplimiento"]
+            ))
+            inspeccion_id = cur.fetchone()[0]
 
-            # Columna TOTAL
-            tot_col = len(fechas_unicas) + 2
-            c_tot = ws2.cell(row=ri, column=tot_col, value=si_count)
-            pct_map = round(si_count / len(fechas_unicas) * 100) if fechas_unicas else 0
-            c_tot.value = f"{si_count}/{len(fechas_unicas)}\n{pct_map}%"
-            if pct_map >= 70:
-                c_tot.fill = PatternFill('solid', start_color=COLOR_VERDE_CLARO)
-                c_tot.font = Font(name='Arial', bold=True, size=9, color=COLOR_VERDE)
-            elif pct_map >= 30:
-                c_tot.fill = PatternFill('solid', start_color=COLOR_AMARILLO_BG)
-                c_tot.font = Font(name='Arial', bold=True, size=9, color=COLOR_NARANJA)
-            else:
-                c_tot.fill = PatternFill('solid', start_color=COLOR_ROJO_CLARO)
-                c_tot.font = Font(name='Arial', bold=True, size=9, color=COLOR_ROJO)
-            c_tot.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            c_tot.border = thin_border()
-            ws2.row_dimensions[ri].height = 20
+            for item in items:
+                cur.execute("""
+                    INSERT INTO inspecciones_items (inspeccion_id, seccion, pregunta, respuesta, observacion_item)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (inspeccion_id, item["seccion"], item["pregunta"],
+                      item["respuesta"], item.get("observacion_item", "")))
 
-        ws2.column_dimensions['A'].width = 12
-        for i in range(2, len(fechas_unicas) + 2):
-            ws2.column_dimensions[get_column_letter(i)].width = 9
-        ws2.column_dimensions[get_column_letter(len(fechas_unicas) + 2)].width = 11
+            c.commit()
+            c.close()
+            return True
+        except Exception as e:
+            st.error(f"Error guardando inspección: {e}")
+            return False
 
-        # Leyenda
-        ley_row = len(placas_unicas) + 4
-        ws2.cell(row=ley_row, column=1, value="LEYENDA:").font = Font(bold=True, name='Arial', size=9)
-        items_ley = [
-            ('✓  INSPECCIONÓ (sin fallas)', COLOR_VERDE_CLARO, COLOR_VERDE),
-            ('✓⚠ INSPECCIONÓ (fallas menores)', COLOR_AMARILLO_BG, COLOR_NARANJA),
-            ('✗  NO INSPECCIONÓ', COLOR_ROJO_CLARO, COLOR_ROJO),
-            ('—  Sin registro', COLOR_GRIS, "999999"),
-        ]
-        for ii, (txt, bg, fg) in enumerate(items_ley, 2):
-            c = ws2.cell(row=ley_row, column=ii, value=txt)
-            c.font = Font(name='Arial', bold=True, color=fg, size=9)
-            c.fill = PatternFill('solid', start_color=bg)
-            c.alignment = Alignment(horizontal='center')
-            c.border = thin_border()
-            ws2.column_dimensions[get_column_letter(ii)].width = max(
-                ws2.column_dimensions[get_column_letter(ii)].width, 22
+    def obtener_inspecciones(self, fecha_ini=None, fecha_fin=None,
+                              maquina=None, operador=None) -> pd.DataFrame:
+        c = self.conn()
+        q = """SELECT id, fecha, maquina, modelo, marca, placa, operador, revisor,
+                      cliente_proyecto, responsable_mantenimiento,
+                      total_items, items_cumple, items_no_cumple, items_na,
+                      porcentaje_cumplimiento, observaciones
+               FROM inspecciones_preoperacionales WHERE 1=1"""
+        params = []
+        if fecha_ini: q += " AND fecha >= %s"; params.append(fecha_ini)
+        if fecha_fin: q += " AND fecha <= %s"; params.append(fecha_fin)
+        if maquina and maquina != "Todas": q += " AND maquina = %s"; params.append(maquina)
+        if operador: q += " AND operador ILIKE %s"; params.append(f"%{operador}%")
+        q += " ORDER BY fecha DESC, id DESC"
+        try:
+            df = pd.read_sql(q, c, params=params)
+            return df
+        except:
+            return pd.DataFrame()
+        finally:
+            c.close()
+
+    def obtener_items_inspeccion(self, inspeccion_id: int) -> pd.DataFrame:
+        c = self.conn()
+        try:
+            df = pd.read_sql(
+                "SELECT seccion, pregunta, respuesta, observacion_item FROM inspecciones_items WHERE inspeccion_id=%s ORDER BY id",
+                c, params=[inspeccion_id]
             )
+            return df
+        except:
+            return pd.DataFrame()
+        finally:
+            c.close()
 
-    # ══════════════════════════════════════════════════════════════
-    # HOJA 3 — DETALLE DE INSPECCIONES (registro completo)
-    # ══════════════════════════════════════════════════════════════
-    ws3 = wb.create_sheet("DETALLE")
+    def eliminar_inspeccion(self, inspeccion_id: int) -> bool:
+        try:
+            c = self.conn()
+            cur = c.cursor()
+            cur.execute("DELETE FROM inspecciones_preoperacionales WHERE id=%s", (inspeccion_id,))
+            c.commit()
+            c.close()
+            return True
+        except Exception as e:
+            st.error(f"Error eliminando: {e}")
+            return False
 
-    cols_export = [
-        ("fecha",          "FECHA",          14),
-        ("placa",          "PLACA",          12),
-        ("conductor",      "CONDUCTOR",      28),
-        ("kilometraje",    "KM",             10),
-        ("_estado",        "ESTADO",         18),
-        ("_fallas_count",  "# FALLAS",       10),
-        ("observaciones",  "OBSERVACIONES",  35),
-        ("hallazgos",      "HALLAZGOS",      35),
-        ("contaminacion",  "CONTAMINACIÓN",  22),
-        ("firma_supervisor","SUPERVISOR",    22),
+    def ya_existe_hoy(self, fecha, maquina) -> bool:
+        c = self.conn()
+        try:
+            df = pd.read_sql(
+                "SELECT id FROM inspecciones_preoperacionales WHERE fecha=%s AND maquina=%s",
+                c, params=[fecha, maquina]
+            )
+            return len(df) > 0
+        except:
+            return False
+        finally:
+            c.close()
+
+    def stats_dashboard(self, fecha_ini, fecha_fin):
+        c = self.conn()
+        try:
+            df = pd.read_sql("""
+                SELECT fecha, maquina, operador, items_cumple, items_no_cumple,
+                       items_na, total_items, porcentaje_cumplimiento
+                FROM inspecciones_preoperacionales
+                WHERE fecha >= %s AND fecha <= %s
+                ORDER BY fecha
+            """, c, params=[fecha_ini, fecha_fin])
+            return df
+        except:
+            return pd.DataFrame()
+        finally:
+            c.close()
+
+    def items_nc_frecuentes(self, fecha_ini, fecha_fin):
+        c = self.conn()
+        try:
+            df = pd.read_sql("""
+                SELECT ii.seccion, ii.pregunta, COUNT(*) as veces
+                FROM inspecciones_items ii
+                JOIN inspecciones_preoperacionales ip ON ii.inspeccion_id = ip.id
+                WHERE ip.fecha >= %s AND ip.fecha <= %s
+                  AND ii.respuesta = 'NC'
+                GROUP BY ii.seccion, ii.pregunta
+                ORDER BY veces DESC
+                LIMIT 15
+            """, c, params=[fecha_ini, fecha_fin])
+            return df
+        except:
+            return pd.DataFrame()
+        finally:
+            c.close()
+
+
+# ==================== EXCEL ====================
+def generar_excel(df: pd.DataFrame, db: 'DB', titulo: str = "Inspecciones Preoperacionales") -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Inspecciones"
+
+    ft_titulo  = Font(name="Calibri", bold=True, size=13, color="FFFFFF")
+    ft_header  = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
+    ft_normal  = Font(name="Calibri", size=9)
+    ft_total   = Font(name="Calibri", bold=True, size=10)
+    ft_nc      = Font(name="Calibri", size=9, color="C0392B", bold=True)
+    ft_cumple  = Font(name="Calibri", size=9, color="1A5C2A", bold=True)
+
+    fill_titulo  = PatternFill("solid", start_color="0F2027")
+    fill_header  = PatternFill("solid", start_color="203A43")
+    fill_alt     = PatternFill("solid", start_color="EBF5FB")
+    fill_total   = PatternFill("solid", start_color="D5DBDB")
+    fill_nc_row  = PatternFill("solid", start_color="FADBD8")
+    fill_ok_row  = PatternFill("solid", start_color="D5F5E3")
+
+    borde  = Border(left=Side(style="thin"), right=Side(style="thin"),
+                    top=Side(style="thin"), bottom=Side(style="thin"))
+    centro = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    izq    = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+    now_col = datetime.now(pytz.timezone("America/Bogota"))
+
+    # ── HOJA 1: Resumen de inspecciones ──
+    total_cols = 15
+    ws.merge_cells(f"A1:{get_column_letter(total_cols)}1")
+    ws["A1"] = f"🔧 {titulo}   |   Generado: {now_col.strftime('%d/%m/%Y %H:%M')} (COL)   |   Total: {len(df)} inspecciones"
+    ws["A1"].font = ft_titulo
+    ws["A1"].fill = fill_titulo
+    ws["A1"].alignment = centro
+    ws.row_dimensions[1].height = 28
+
+    columnas = [
+        ("id",                       "ID",            6),
+        ("fecha",                    "FECHA",         12),
+        ("maquina",                  "MÁQUINA",       20),
+        ("modelo",                   "MODELO",        14),
+        ("marca",                    "MARCA",         14),
+        ("placa",                    "PLACA",         12),
+        ("operador",                 "OPERADOR",      24),
+        ("revisor",                  "REVISOR",       22),
+        ("cliente_proyecto",         "CLIENTE/PROYECTO", 22),
+        ("total_items",              "TOTAL ÍTEMS",   10),
+        ("items_cumple",             "✅ CUMPLE",     10),
+        ("items_no_cumple",          "❌ NO CUMPLE",  11),
+        ("items_na",                 "N/A",           8),
+        ("porcentaje_cumplimiento",  "% CUMPLIMIENTO",14),
+        ("observaciones",            "OBSERVACIONES", 30),
     ]
-    for label, short in ITEMS_INSPECCION.items():
-        cols_export.append((short, label.upper(), 20))
 
-    n_cols3 = len(cols_export)
-    ws3.merge_cells(f'A1:{get_column_letter(n_cols3)}1')
-    t3 = ws3['A1']
-    t3.value = f"DETALLE COMPLETO DE INSPECCIONES — {titulo_reporte}"
-    t3.font = Font(name='Arial', bold=True, color="FFFFFF", size=12)
-    t3.fill = PatternFill('solid', start_color=COLOR_HEADER)
-    t3.alignment = Alignment(horizontal='center', vertical='center')
-    ws3.row_dimensions[1].height = 28
+    for idx, (key, nombre, ancho) in enumerate(columnas, start=1):
+        cell = ws.cell(row=2, column=idx, value=nombre)
+        cell.font = ft_header
+        cell.fill = fill_header
+        cell.alignment = centro
+        cell.border = borde
+        ws.column_dimensions[get_column_letter(idx)].width = ancho
+    ws.row_dimensions[2].height = 26
 
-    for ci, (_, nombre, ancho) in enumerate(cols_export, 1):
-        header_cell(ws3, 2, ci, nombre, size=9)
-        ws3.column_dimensions[get_column_letter(ci)].width = ancho
-    ws3.row_dimensions[2].height = 26
+    for row_idx, (_, fila) in enumerate(df.iterrows(), start=3):
+        pct = float(fila.get("porcentaje_cumplimiento", 0) or 0)
+        es_nc = pct < 80
+        fill_f = fill_nc_row if es_nc else (fill_alt if row_idx % 2 == 0 else None)
 
-    df_sorted = df.copy()
-    if fecha_col in df_sorted.columns:
-        df_sorted = df_sorted.sort_values([fecha_col, "placa"], na_position="last")
+        for col_idx, (key, _, _) in enumerate(columnas, start=1):
+            val = fila.get(key, "")
+            if isinstance(val, float) and pd.isna(val): val = ""
+            if key == "porcentaje_cumplimiento" and val != "":
+                val = f"{float(val):.1f}%"
+            cell = ws.cell(row=row_idx, column=col_idx, value=str(val) if val != "" else "")
+            cell.border = borde
+            cell.alignment = centro if key in ("id","fecha","total_items","items_cumple","items_no_cumple","items_na","porcentaje_cumplimiento","placa","modelo","marca") else izq
+            if key == "porcentaje_cumplimiento":
+                cell.font = ft_nc if es_nc else ft_cumple
+            else:
+                cell.font = ft_normal
+            if fill_f: cell.fill = fill_f
+        ws.row_dimensions[row_idx].height = 18
 
-    for ri, (_, row) in enumerate(df_sorted.iterrows(), 3):
-        estado = str(row.get("_estado", ""))
-        es_crit = "Críticas" in estado
-        es_warn = "Menores"  in estado
+    total_row = len(df) + 3
+    ws.merge_cells(f"A{total_row}:{get_column_letter(total_cols)}{total_row}")
+    pct_prom = df["porcentaje_cumplimiento"].mean() if len(df) > 0 else 0
+    ct = ws.cell(row=total_row, column=1,
+                 value=f"TOTAL: {len(df)} inspecciones   |   Cumplimiento promedio: {pct_prom:.1f}%")
+    ct.font = ft_total
+    ct.fill = fill_total
+    ct.alignment = centro
+    ws.freeze_panes = "A3"
 
-        for ci, (short, _, _) in enumerate(cols_export, 1):
-            val = row.get(short, "")
-            if pd.isna(val):
-                val = ""
-            if hasattr(val, "strftime"):
-                val = val.strftime("%d/%m/%Y")
+    # ── HOJA 2: Detalle por ítems ──
+    ws2 = wb.create_sheet("Detalle Ítems")
+    ws2["A1"] = "Detalle de Ítems por Inspección"
+    ws2["A1"].font = Font(name="Calibri", bold=True, size=13, color="FFFFFF")
+    ws2["A1"].fill = PatternFill("solid", start_color="0F2027")
+    ws2["A1"].alignment = centro
+    ws2.row_dimensions[1].height = 26
 
-            c = ws3.cell(ri, ci, str(val) if val != "" else "")
-            c.border = thin_border()
-            c.alignment = Alignment(
-                horizontal='center' if ci <= 6 else 'left',
-                vertical='center', wrap_text=True
-            )
-            c.font = Font(name='Arial', size=9)
+    hdrs2 = ["ID INSP.", "FECHA", "MÁQUINA", "OPERADOR", "SECCIÓN", "PREGUNTA", "RESPUESTA", "OBSERVACIÓN ÍTEM"]
+    anchos2 = [8, 12, 20, 22, 28, 60, 12, 30]
+    for ci, (h, w) in enumerate(zip(hdrs2, anchos2), start=1):
+        c = ws2.cell(2, ci, h)
+        c.font = ft_header
+        c.fill = PatternFill("solid", start_color="203A43")
+        c.alignment = centro
+        c.border = borde
+        ws2.column_dimensions[get_column_letter(ci)].width = w
+    ws2.row_dimensions[2].height = 22
 
-            # Color de fondo según estado
-            if short in ITEMS_INSPECCION.values() and es_falla(val):
-                c.fill = PatternFill('solid', start_color=COLOR_ROJO_CLARO)
-                c.font = Font(name='Arial', size=9, color=COLOR_ROJO, bold=True)
-            elif ci == 5:  # columna ESTADO
-                if es_crit:
-                    c.fill = PatternFill('solid', start_color=COLOR_ROJO_CLARO)
-                    c.font = Font(name='Arial', size=9, color=COLOR_ROJO, bold=True)
-                elif es_warn:
-                    c.fill = PatternFill('solid', start_color=COLOR_AMARILLO_BG)
-                    c.font = Font(name='Arial', size=9, color=COLOR_NARANJA, bold=True)
-                else:
-                    c.fill = PatternFill('solid', start_color=COLOR_VERDE_CLARO)
-                    c.font = Font(name='Arial', size=9, color=COLOR_VERDE, bold=True)
-            elif ri % 2 == 0:
-                c.fill = PatternFill('solid', start_color="EBF5FB")
+    fila_det = 3
+    fill_seccion_colors = {
+        "ANTES DE SU USO": PatternFill("solid", start_color="EBF5FB"),
+        "INSPECCIÓN DEL LUGAR DE TRABAJO": PatternFill("solid", start_color="FEF9E7"),
+        "ELEMENTOS DE PROTECCIÓN PERSONAL (EPP)": PatternFill("solid", start_color="F9EBEA"),
+        "SEGURIDAD ELÉCTRICA": PatternFill("solid", start_color="EAFAF1"),
+    }
 
-        ws3.row_dimensions[ri].height = 16
+    for _, fila_insp in df.iterrows():
+        items_df = db.obtener_items_inspeccion(int(fila_insp["id"]))
+        if items_df.empty:
+            continue
+        for _, item in items_df.iterrows():
+            fill_c = fill_seccion_colors.get(str(item.get("seccion", "")))
+            resp = str(item.get("respuesta", ""))
+            if resp == "NC":
+                fill_c = fill_nc_row
+
+            vals = [
+                str(fila_insp["id"]),
+                str(fila_insp["fecha"]),
+                str(fila_insp["maquina"]),
+                str(fila_insp["operador"]),
+                str(item.get("seccion", "")),
+                str(item.get("pregunta", "")),
+                resp,
+                str(item.get("observacion_item", "") or ""),
+            ]
+            for ci, v in enumerate(vals, start=1):
+                cell = ws2.cell(fila_det, ci, v)
+                cell.border = borde
+                cell.font = ft_nc if resp == "NC" else ft_normal
+                cell.alignment = centro if ci in (1, 2, 7) else izq
+                if fill_c: cell.fill = fill_c
+            ws2.row_dimensions[fila_det].height = 16
+            fila_det += 1
+
+    ws2.freeze_panes = "A3"
+
+    # ── HOJA 3: Resumen por Máquina ──
+    ws3 = wb.create_sheet("Por Máquina")
+    ws3["A1"] = "Resumen de Cumplimiento por Máquina"
+    ws3["A1"].font = Font(name="Calibri", bold=True, size=13, color="FFFFFF")
+    ws3["A1"].fill = PatternFill("solid", start_color="0F2027")
+    ws3["A1"].alignment = centro
+    ws3.row_dimensions[1].height = 26
+
+    hdrs3 = ["MÁQUINA", "INSPECCIONES", "% PROM. CUMPL.", "MIN %", "MAX %", "NC TOTAL"]
+    anchos3 = [24, 12, 16, 10, 10, 10]
+    for ci, (h, w) in enumerate(zip(hdrs3, anchos3), start=1):
+        c = ws3.cell(2, ci, h)
+        c.font = ft_header
+        c.fill = PatternFill("solid", start_color="203A43")
+        c.alignment = centro
+        c.border = borde
+        ws3.column_dimensions[get_column_letter(ci)].width = w
+    ws3.row_dimensions[2].height = 22
+
+    if "maquina" in df.columns and not df.empty:
+        df_maq = df.groupby("maquina").agg(
+            inspecciones=("id", "count"),
+            pct_prom=("porcentaje_cumplimiento", "mean"),
+            pct_min=("porcentaje_cumplimiento", "min"),
+            pct_max=("porcentaje_cumplimiento", "max"),
+            nc_total=("items_no_cumple", "sum"),
+        ).reset_index().sort_values("pct_prom")
+
+        for i, row in enumerate(df_maq.itertuples(), start=3):
+            fill_c = PatternFill("solid", start_color="FADBD8") if row.pct_prom < 80 else (
+                PatternFill("solid", start_color="EBF5FB") if i % 2 == 0 else None)
+            vals = [row.maquina, row.inspecciones,
+                    f"{row.pct_prom:.1f}%", f"{row.pct_min:.1f}%",
+                    f"{row.pct_max:.1f}%", int(row.nc_total)]
+            for ci, v in enumerate(vals, start=1):
+                cell = ws3.cell(i, ci, v)
+                cell.font = ft_nc if (ci == 3 and row.pct_prom < 80) else ft_normal
+                cell.border = borde
+                cell.alignment = izq if ci == 1 else centro
+                if fill_c: cell.fill = fill_c
 
     ws3.freeze_panes = "A3"
 
-    # ══════════════════════════════════════════════════════════════
-    # HOJA 4 — FALLAS POR ÍTEM (ranking)
-    # ══════════════════════════════════════════════════════════════
-    ws4 = wb.create_sheet("FALLAS POR ÍTEM")
+    # ── HOJA 4: Top NC ──
+    ws4 = wb.create_sheet("Top No Cumple")
+    ws4["A1"] = "Ítems con Más Incumplimientos"
+    ws4["A1"].font = Font(name="Calibri", bold=True, size=13, color="FFFFFF")
+    ws4["A1"].fill = PatternFill("solid", start_color="0F2027")
+    ws4["A1"].alignment = centro
+    ws4.row_dimensions[1].height = 26
 
-    ws4.merge_cells('A1:D1')
-    t4 = ws4['A1']
-    t4.value = "RANKING DE FALLAS POR ÍTEM DE INSPECCIÓN"
-    t4.font = Font(name='Arial', bold=True, color="FFFFFF", size=12)
-    t4.fill = PatternFill('solid', start_color=COLOR_HEADER)
-    t4.alignment = Alignment(horizontal='center', vertical='center')
-    ws4.row_dimensions[1].height = 28
+    hdrs4 = ["#", "SECCIÓN", "PREGUNTA", "VECES NC"]
+    anchos4 = [5, 28, 70, 10]
+    for ci, (h, w) in enumerate(zip(hdrs4, anchos4), start=1):
+        c = ws4.cell(2, ci, h)
+        c.font = ft_header
+        c.fill = PatternFill("solid", start_color="922B21")
+        c.alignment = centro
+        c.border = borde
+        ws4.column_dimensions[get_column_letter(ci)].width = w
+    ws4.row_dimensions[2].height = 22
 
-    hdrs4 = ['ÍTEM DE INSPECCIÓN', 'TOTAL FALLAS', '% DEL TOTAL', 'INDICADOR']
-    for ci, h in enumerate(hdrs4, 1):
-        header_cell(ws4, 2, ci, h)
-    ws4.row_dimensions[2].height = 26
+    # Calcular Top NC desde items
+    nc_data = []
+    for _, fila_insp in df.iterrows():
+        items_df = db.obtener_items_inspeccion(int(fila_insp["id"]))
+        if not items_df.empty:
+            nc = items_df[items_df["respuesta"] == "NC"]
+            for _, r in nc.iterrows():
+                nc_data.append({"seccion": r["seccion"], "pregunta": r["pregunta"]})
 
-    fallas_items = []
-    for label, short in ITEMS_INSPECCION.items():
-        if short in df.columns:
-            cnt = int(df[short].apply(es_falla).sum())
-            fallas_items.append((label, cnt))
-    fallas_items.sort(key=lambda x: x[1], reverse=True)
-    total_fallas_all = sum(x[1] for x in fallas_items) or 1
+    if nc_data:
+        df_nc = pd.DataFrame(nc_data)
+        df_nc_agg = df_nc.groupby(["seccion", "pregunta"]).size().reset_index(name="veces").sort_values("veces", ascending=False).head(20)
+        for i, row in enumerate(df_nc_agg.itertuples(), start=3):
+            fill_c = PatternFill("solid", start_color="FADBD8") if i <= 4 else (
+                PatternFill("solid", start_color="FEF9E7") if i % 2 == 0 else None)
+            vals = [i - 2, row.seccion, row.pregunta, row.veces]
+            for ci, v in enumerate(vals, start=1):
+                cell = ws4.cell(i, ci, v)
+                cell.font = ft_nc if i <= 4 else ft_normal
+                cell.border = borde
+                cell.alignment = centro if ci in (1, 4) else izq
+                if fill_c: cell.fill = fill_c
 
-    for ri, (label, cnt) in enumerate(fallas_items, 3):
-        pct_v = round(cnt / total_fallas_all * 100, 1)
-        bg = COLOR_ROJO_CLARO if cnt > 0 else ("EBF5FB" if ri % 2 == 0 else None)
-        fg = COLOR_ROJO if cnt > 0 else "000000"
-        data_cell(ws4, ri, 1, label,   bg=bg, center=False, fg=fg, bold=(cnt > 0))
-        data_cell(ws4, ri, 2, cnt,     bg=bg, fg=fg, bold=(cnt > 0))
-        data_cell(ws4, ri, 3, pct_v / 100, bg=bg, fg=fg, fmt='0.0%')
-        # Barra visual de texto
-        barras = int(pct_v / 5)
-        barra_txt = "█" * barras + "░" * (20 - barras)
-        c_bar = ws4.cell(ri, 4, barra_txt)
-        c_bar.font = Font(name='Courier New', size=8, color=COLOR_ROJO if cnt > 0 else "BBBBBB")
-        c_bar.border = thin_border()
-        c_bar.alignment = Alignment(horizontal='left', vertical='center')
-        ws4.row_dimensions[ri].height = 18
-
-    for col_l, w in zip(["A","B","C","D"], [38, 14, 12, 24]):
-        ws4.column_dimensions[col_l].width = w
-
-    # ══════════════════════════════════════════════════════════════
-    # HOJA 5 — REPORTE CONDUCTORES
-    # ══════════════════════════════════════════════════════════════
-    ws5 = wb.create_sheet("CONDUCTORES")
-
-    ws5.merge_cells('A1:G1')
-    t5 = ws5['A1']
-    t5.value = "REPORTE DE INSPECCIONES POR CONDUCTOR"
-    t5.font = Font(name='Arial', bold=True, color="FFFFFF", size=12)
-    t5.fill = PatternFill('solid', start_color=COLOR_HEADER)
-    t5.alignment = Alignment(horizontal='center', vertical='center')
-    ws5.row_dimensions[1].height = 28
-
-    hdrs5 = ["CONDUCTOR", "PLACA", "FECHA", "DÍA", "ESTADO", "# FALLAS", "OBSERVACIONES"]
-    for ci, h in enumerate(hdrs5, 1):
-        header_cell(ws5, 2, ci, h)
-    ws5.row_dimensions[2].height = 26
-
-    cols5 = ["conductor", "placa", fecha_col, "_estado", "_fallas_count", "observaciones"]
-    df5 = df[[c for c in cols5 if c in df.columns]].copy()
-    if fecha_col in df5.columns:
-        df5 = df5.sort_values([fecha_col, "conductor"], na_position="last")
-
-    for ri, (_, row) in enumerate(df5.iterrows(), 3):
-        fv       = row.get(fecha_col, "")
-        fecha_s  = fv.strftime("%d/%m/%Y") if hasattr(fv, "strftime") and not pd.isna(fv) else str(fv)
-        dia_s    = DIAS_ES.get(fv.strftime("%A"), "") if hasattr(fv, "strftime") and not pd.isna(fv) else ""
-        estado_v = str(row.get("_estado", ""))
-        vals5    = [
-            str(row.get("conductor","")).strip() or "—",
-            str(row.get("placa","")).strip() or "—",
-            fecha_s, dia_s, estado_v,
-            int(row.get("_fallas_count", 0)) if not pd.isna(row.get("_fallas_count", 0)) else 0,
-            str(row.get("observaciones","")).strip() or "",
-        ]
-        if "Críticas" in estado_v:
-            row_bg = COLOR_ROJO_CLARO
-        elif "Menores" in estado_v:
-            row_bg = COLOR_WARN_BG
-        elif "Sin" in estado_v:
-            row_bg = COLOR_VERDE_CLARO
-        else:
-            row_bg = "EBF5FB" if ri % 2 == 0 else None
-
-        for ci, v in enumerate(vals5, 1):
-            c = ws5.cell(ri, ci, v)
-            c.border = thin_border()
-            c.font = Font(name='Arial', size=9)
-            c.alignment = Alignment(
-                horizontal='left' if ci in (1, 7) else 'center',
-                vertical='center', wrap_text=True
-            )
-            if row_bg:
-                c.fill = PatternFill('solid', start_color=row_bg)
-        ws5.row_dimensions[ri].height = 16
-
-    for col_l, w in zip(["A","B","C","D","E","F","G"], [30,12,14,12,18,10,45]):
-        ws5.column_dimensions[col_l].width = w
-
-    ws5.freeze_panes = "A3"
+    ws4.freeze_panes = "A3"
 
     output = io.BytesIO()
     wb.save(output)
@@ -726,451 +659,405 @@ def generar_excel_inspeccion(df: pd.DataFrame, titulo_reporte: str = "REPORTE DE
 def main():
     st.markdown("""
     <div class="main-header">
-        <h1>🔍 INSPECCIONES VEHICULARES</h1>
-        <p>Reporte y análisis de inspecciones pre-operacionales · Google Sheets</p>
+        <h1>🔧 REGISTRO PRE<span class="accent">OPERACIONAL</span> DE EQUIPO</h1>
+        <p>CONTROL DE INSPECCIONES · SCA ZF · TRAZABILIDAD TOTAL</p>
     </div>
     """, unsafe_allow_html=True)
 
-    with st.sidebar:
-        st.markdown("### ⚙️ Opciones")
-        if st.button("🔄 Recargar datos", type="primary"):
-            st.cache_data.clear()
-            st.rerun()
-        st.divider()
-        st.caption(f"📊 Fuente: Google Sheets configurada")
-        st.caption(f"🕐 Caché: 5 minutos")
+    if "db" not in st.session_state:
+        st.session_state.db = DB()
+    if "viendo_id" not in st.session_state:
+        st.session_state.viendo_id = None
 
-    with st.spinner("📡 Conectando con Google Sheets..."):
-        df_raw = cargar_datos_sheets(SHEET_ID, SHEET_NAME)
+    db = st.session_state.db
 
-    if df_raw.empty:
-        st.error("No se pudieron cargar datos. Verifica que la hoja esté compartida públicamente.")
-        st.stop()
+    tab1, tab2, tab3 = st.tabs(["📋 Nueva Inspección", "🔍 Historial y Reportes", "📊 Dashboard"])
 
-    tab1, tab2, tab3 = st.tabs(["📋 Historial", "📊 Dashboard", "🔎 Detalle"])
-
-    # ===================== TAB 1: HISTORIAL =====================
+    # ======================== TAB 1: NUEVA INSPECCIÓN ========================
     with tab1:
-        st.markdown("### 📋 Historial de Inspecciones")
+        st.markdown("### Registrar Inspección Preoperacional")
 
-        fecha_col_name = "fecha" if ("fecha" in df_raw.columns and df_raw["fecha"].notna().any()) else "marca_temporal"
-        fechas_validas = df_raw[fecha_col_name].dropna() if fecha_col_name in df_raw.columns else pd.Series([], dtype="datetime64[ns]")
+        # ── Datos del equipo ──
+        st.markdown('<div class="seccion-header">1. DATOS DEL EQUIPO</div>', unsafe_allow_html=True)
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            fecha = st.date_input("📅 Fecha", datetime.now(), key="n_fecha")
+        with d2:
+            maquina = st.selectbox("🏭 Máquina / Equipo", MAQUINAS, key="n_maq")
+        with d3:
+            modelo = st.text_input("Modelo", key="n_modelo", placeholder="Ej: ZF-2025")
+        with d4:
+            marca = st.text_input("Marca", key="n_marca", placeholder="Ej: SCA")
+
+        d5, d6, d7, d8 = st.columns(4)
+        with d5:
+            placa = st.text_input("Placa / Serie", key="n_placa", placeholder="Ej: SCA-001")
+        with d6:
+            operador_sel = st.selectbox("👷 Operador", ["— Seleccionar —"] + OPERADORES, key="n_op")
+        with d7:
+            revisor_sel = st.selectbox("👁️ Revisado por", ["— Seleccionar —"] + REVISORES, key="n_rev")
+        with d8:
+            cliente_proy = st.text_input("Cliente / Proyecto", key="n_cli", placeholder="Nombre del cliente...")
+
+        resp_mantenimiento = st.text_input("🔧 Responsable Mantenimiento", key="n_mant", placeholder="Nombre del responsable de mantenimiento...")
+
+        # Verificar si ya existe inspección hoy
+        if maquina:
+            ya_existe = db.ya_existe_hoy(fecha, maquina)
+            if ya_existe:
+                st.warning(f"⚠️ Ya existe una inspección para **{maquina}** el **{fecha}**. Si continúas se creará un duplicado.")
+
+        # ── Checklist ──
+        st.markdown('<div class="seccion-header">2. LISTA DE ACTIVIDADES</div>', unsafe_allow_html=True)
+        st.caption("Marca cada ítem: **C** = Cumple · **NC** = No Cumple · **N/A** = No Aplica")
+
+        respuestas = {}
+        obs_items = {}
+        nc_detectados = []
+
+        for seccion, preguntas in CHECKLIST.items():
+            st.markdown(f'<div class="seccion-header" style="font-size:0.85rem; margin-top:0.8rem;">📌 {seccion}</div>', unsafe_allow_html=True)
+            for i, pregunta in enumerate(preguntas):
+                key_base = f"resp_{seccion[:10]}_{i}"
+                col_preg, col_resp, col_obs = st.columns([5, 2, 3])
+                with col_preg:
+                    st.markdown(f'<div class="item-pregunta">{pregunta}</div>', unsafe_allow_html=True)
+                with col_resp:
+                    resp = st.radio(
+                        "Respuesta",
+                        options=["C", "NC", "N/A"],
+                        index=0,
+                        key=key_base,
+                        horizontal=True,
+                        label_visibility="collapsed"
+                    )
+                    respuestas[(seccion, pregunta)] = resp
+                with col_obs:
+                    obs_i = ""
+                    if resp == "NC":
+                        nc_detectados.append(pregunta[:60])
+                        obs_i = st.text_input(
+                            "Observación del ítem",
+                            key=f"obs_{key_base}",
+                            placeholder="Describir hallazgo...",
+                            label_visibility="collapsed"
+                        )
+                    obs_items[(seccion, pregunta)] = obs_i
+
+        # Resumen en tiempo real
+        total = len(respuestas)
+        cumple = sum(1 for v in respuestas.values() if v == "C")
+        no_cumple = sum(1 for v in respuestas.values() if v == "NC")
+        na = sum(1 for v in respuestas.values() if v == "N/A")
+        efectivos = total - na
+        pct = round(cumple / efectivos * 100, 1) if efectivos > 0 else 0
+
+        st.divider()
+        st.markdown("#### 📊 Resumen en tiempo real")
+        r1, r2, r3, r4, r5 = st.columns(5)
+        r1.metric("Total ítems", total)
+        r2.metric("✅ Cumple", cumple)
+        r3.metric("❌ No Cumple", no_cumple)
+        r4.metric("➖ N/A", na)
+        r5.metric("📈 % Cumplimiento", f"{pct}%")
+
+        if no_cumple > 0:
+            st.markdown(
+                f'<div class="alerta-nc">⚠️ <strong>{no_cumple} ítem(s) con NO CUMPLE.</strong> '
+                f'Reportar inmediatamente al encargado de equipos y al departamento de mantenimiento.<br>'
+                f'<em>{" · ".join(nc_detectados[:5])}</em></div>',
+                unsafe_allow_html=True
+            )
+        if pct == 100:
+            st.markdown('<div class="resultado-cumple">✅ INSPECCIÓN 100% — EQUIPO APTO PARA OPERAR</div>', unsafe_allow_html=True)
+        elif pct >= 80:
+            st.markdown(f'<div class="resultado-cumple">✅ INSPECCIÓN APROBADA — {pct}% cumplimiento</div>', unsafe_allow_html=True)
+        elif pct > 0:
+            st.markdown(f'<div class="resultado-nc">❌ INSPECCIÓN CON OBSERVACIONES — {pct}% cumplimiento — REVISAR ANTES DE OPERAR</div>', unsafe_allow_html=True)
+
+        # ── Sección 3: Datos de control ──
+        st.markdown('<div class="seccion-header">3. OBSERVACIONES GENERALES Y DATOS DE CONTROL</div>', unsafe_allow_html=True)
+        observaciones = st.text_area("📝 Comentarios / Observaciones generales", height=100, key="n_obs",
+                                      placeholder="Cualquier anomalía, favor reportarla en el proyecto y al encargado de equipos...")
+
+        st.divider()
+        col_btn1, col_btn2 = st.columns([1, 3])
+        with col_btn1:
+            guardar = st.button("💾 Guardar Inspección", type="primary", use_container_width=True)
+
+        if guardar:
+            operador = "" if operador_sel == "— Seleccionar —" else operador_sel
+            revisor  = "" if revisor_sel  == "— Seleccionar —" else revisor_sel
+
+            if not operador:
+                st.error("⚠️ Selecciona el operador antes de guardar.")
+            else:
+                datos = {
+                    "fecha": fecha,
+                    "maquina": maquina,
+                    "modelo": modelo,
+                    "marca": marca,
+                    "placa": placa,
+                    "operador": operador,
+                    "revisor": revisor,
+                    "cliente_proyecto": cliente_proy,
+                    "responsable_mantenimiento": resp_mantenimiento,
+                    "observaciones": observaciones,
+                    "total_items": total,
+                    "items_cumple": cumple,
+                    "items_no_cumple": no_cumple,
+                    "items_na": na,
+                    "porcentaje_cumplimiento": pct,
+                }
+                items = [
+                    {
+                        "seccion": sec,
+                        "pregunta": preg,
+                        "respuesta": resp,
+                        "observacion_item": obs_items.get((sec, preg), "")
+                    }
+                    for (sec, preg), resp in respuestas.items()
+                ]
+                if db.guardar_inspeccion(datos, items):
+                    st.success(f"✅ Inspección guardada — {maquina} | {operador} | {fecha} | {pct}% cumplimiento")
+                    st.balloons()
+
+    # ======================== TAB 2: HISTORIAL ========================
+    with tab2:
+        st.markdown("### 🔍 Historial de Inspecciones")
 
         with st.expander("🛠️ Filtros", expanded=True):
-            fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+            f1, f2, f3, f4 = st.columns(4)
+            with f1: fi   = st.date_input("Desde", datetime.now() - timedelta(days=30), key="h_fi")
+            with f2: ff   = st.date_input("Hasta", datetime.now(), key="h_ff")
+            with f3:
+                maq_f = st.selectbox("Máquina", ["Todas"] + MAQUINAS, key="h_maq")
+            with f4:
+                op_f = st.text_input("Operador", key="h_op")
 
-            with fc1:
-                f_min = fechas_validas.min().date() if len(fechas_validas) > 0 else (datetime.now().date() - timedelta(days=30))
-                fi = st.date_input("Desde", f_min, key="h_fi")
-            with fc2:
-                f_max = fechas_validas.max().date() if len(fechas_validas) > 0 else datetime.now().date()
-                ff = st.date_input("Hasta", f_max, key="h_ff")
-            with fc3:
-                if "conductor" in df_raw.columns and "placa" in df_raw.columns:
-                    cond_placa = (
-                        df_raw[df_raw["conductor"].notna() & (df_raw["conductor"] != "")]
-                        .groupby("conductor")["placa"]
-                        .apply(lambda x: ", ".join(sorted(x.dropna().unique())))
-                        .reset_index()
-                    )
-                    cond_placa["opcion"] = cond_placa.apply(
-                        lambda r: f"{r['conductor']} ({r['placa']})" if r["placa"] else r["conductor"],
-                        axis=1
-                    )
-                    opciones_conductor = ["Todos"] + sorted(cond_placa["opcion"].tolist())
-                    cond_label_to_name = dict(zip(cond_placa["opcion"], cond_placa["conductor"]))
-                else:
-                    opciones_conductor = ["Todos"]
-                    cond_label_to_name = {}
-                fc_sel = st.selectbox("Conductor (Placas)", opciones_conductor)
-            with fc4:
-                placas_disp = ["Todas"] + sorted(df_raw["placa"].dropna().unique().tolist()) if "placa" in df_raw.columns else ["Todas"]
-                fp = st.selectbox("Placa", placas_disp)
-            with fc5:
-                estados_disp = ["Todos", "✅ Sin Fallas", "⚠️ Fallas Menores", "❌ Fallas Críticas"] if "_estado" in df_raw.columns else ["Todos"]
-                fe = st.selectbox("Estado", estados_disp)
+        df = db.obtener_inspecciones(fi, ff, maq_f, op_f)
 
-        df = df_raw.copy()
-        if fecha_col_name in df.columns and fechas_validas.notna().any():
-            df = df[df[fecha_col_name].dt.date.between(fi, ff)]
-        if fc_sel != "Todos" and "conductor" in df.columns:
-            nombre_sel = cond_label_to_name.get(fc_sel, fc_sel)
-            df = df[df["conductor"] == nombre_sel]
-        if fp != "Todas" and "placa" in df.columns:
-            df = df[df["placa"] == fp]
-        if fe != "Todos" and "_estado" in df.columns:
-            df = df[df["_estado"] == fe]
+        if not df.empty:
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total Inspecciones", len(df))
+            k2.metric("✅ ≥ 80%", len(df[df["porcentaje_cumplimiento"] >= 80]))
+            k3.metric("❌ < 80%", len(df[df["porcentaje_cumplimiento"] < 80]))
+            k4.metric("📊 % Promedio", f"{df['porcentaje_cumplimiento'].mean():.1f}%")
 
-        total  = len(df)
-        sin_f  = (df["_estado"] == "✅ Sin Fallas").sum()    if "_estado" in df.columns else 0
-        men_f  = df["_estado"].str.contains("Menores",  na=False).sum() if "_estado" in df.columns else 0
-        crit_f = df["_estado"].str.contains("Críticas", na=False).sum() if "_estado" in df.columns else 0
-        pct_ok = round(sin_f / total * 100) if total > 0 else 0
+            st.divider()
 
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("🔍 Total Inspecciones", total)
-        k2.metric("✅ Sin Fallas",         sin_f,  f"{pct_ok}%")
-        k3.metric("⚠️ Fallas Menores",     men_f)
-        k4.metric("❌ Fallas Críticas",    crit_f)
-        k5.metric("🚗 Vehículos únicos",   df["placa"].nunique() if "placa" in df.columns else 0)
-
-        st.divider()
-
-        col_rep, col_btn = st.columns([2, 3])
-        with col_rep:
-            nombre_rep = st.text_input("Nombre del reporte", value="Inspecciones_Vehiculares")
-        with col_btn:
-            st.markdown("<br>", unsafe_allow_html=True)
-            if total > 0:
-                # Construir título con rango de fechas
-                if fecha_col_name in df.columns and df[fecha_col_name].notna().any():
-                    fd_min = df[fecha_col_name].min().strftime("%d/%m/%Y")
-                    fd_max = df[fecha_col_name].max().strftime("%d/%m/%Y")
-                    titulo_excel = f"INSPECCIONES VEHICULARES  {fd_min} — {fd_max}"
-                else:
-                    titulo_excel = "INSPECCIONES VEHICULARES"
-
-                excel_data = generar_excel_inspeccion(df, titulo_reporte=titulo_excel)
+            col_e1, col_e2 = st.columns([2, 5])
+            with col_e1:
+                nombre_rep = st.text_input("Nombre del reporte", value="Inspecciones_Preoperacionales", key="rep_nom")
+            with col_e2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                excel_data = generar_excel(df, db, titulo=nombre_rep)
                 st.download_button(
-                    "⬇️ Descargar Excel completo",
+                    "⬇️ Descargar Excel",
                     data=excel_data,
-                    file_name=f"{nombre_rep}_{datetime.now(BOGOTA_TZ).strftime('%Y%m%d_%H%M')}.xlsx",
+                    file_name=f"{nombre_rep}_{datetime.now(pytz.timezone('America/Bogota')).strftime('%Y%m%d_%H%M')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary"
                 )
 
-        st.divider()
+            st.divider()
 
-        cols_tabla = [c for c in [fecha_col_name, "placa", "conductor", "kilometraje", "_estado", "_fallas_count", "observaciones", "hallazgos"] if c in df.columns]
-        rename_tabla = {
-            "marca_temporal": "Registro", "fecha": "Fecha", "placa": "Placa",
-            "conductor": "Conductor", "kilometraje": "KM",
-            "_estado": "Estado", "_fallas_count": "# Fallas",
-            "observaciones": "Observaciones", "hallazgos": "Hallazgos"
-        }
-        if not df.empty:
-            df_show = df[cols_tabla].rename(columns=rename_tabla).copy()
-            fecha_col_show = "Registro" if "marca_temporal" in cols_tabla else "Fecha"
-            if fecha_col_show in df_show.columns:
-                df_show[fecha_col_show] = df_show[fecha_col_show].apply(
-                    lambda x: x.strftime("%d/%m/%Y") if hasattr(x, "strftime") and not pd.isna(x) else ""
-                )
-            st.dataframe(df_show, use_container_width=True, hide_index=True)
+            cols_tabla = ["id", "fecha", "maquina", "operador", "revisor",
+                          "items_cumple", "items_no_cumple", "porcentaje_cumplimiento"]
+            cols_ex = [c for c in cols_tabla if c in df.columns]
+
+            # Color condicional
+            def color_pct(val):
+                try:
+                    v = float(str(val).replace("%",""))
+                    color = "#d4edda" if v >= 80 else "#f8d7da"
+                    return f"background-color: {color}"
+                except:
+                    return ""
+
+            st.dataframe(
+                df[cols_ex].style.applymap(color_pct, subset=["porcentaje_cumplimiento"]),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.divider()
+            st.subheader("🔎 Ver Detalle de Inspección")
+            df["_label"] = df.apply(
+                lambda r: f"ID {r['id']} | {r['fecha']} | {r['maquina']} | {r['operador']} | {r['porcentaje_cumplimiento']:.1f}%",
+                axis=1
+            )
+            sel = st.selectbox("Seleccionar inspección:", df["_label"].tolist(), key="h_sel")
+
+            if sel:
+                vid = int(sel.split(" | ")[0].replace("ID ", ""))
+                row = df[df["id"] == vid].iloc[0]
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.info(f"**Máquina:** {row['maquina']}")
+                    st.write(f"**Operador:** {row.get('operador','')}")
+                    st.write(f"**Revisor:** {row.get('revisor','')}")
+                    st.write(f"**Fecha:** {row['fecha']}")
+                with c2:
+                    st.write(f"**Modelo:** {row.get('modelo','')}")
+                    st.write(f"**Marca:** {row.get('marca','')}")
+                    st.write(f"**Placa:** {row.get('placa','')}")
+                    st.write(f"**Cliente/Proyecto:** {row.get('cliente_proyecto','')}")
+                with c3:
+                    pct_v = float(row.get('porcentaje_cumplimiento', 0))
+                    color = "🟢" if pct_v >= 80 else "🔴"
+                    st.write(f"**{color} Cumplimiento:** {pct_v:.1f}%")
+                    st.write(f"**✅ Cumple:** {row.get('items_cumple',0)}")
+                    st.write(f"**❌ No Cumple:** {row.get('items_no_cumple',0)}")
+                    st.write(f"**➖ N/A:** {row.get('items_na',0)}")
+                    if row.get("observaciones"):
+                        st.write(f"**📝 Obs:** {row['observaciones']}")
+
+                # Detalle de ítems
+                items_df = db.obtener_items_inspeccion(vid)
+                if not items_df.empty:
+                    st.markdown("##### 📋 Detalle del Checklist")
+                    for sec in items_df["seccion"].unique():
+                        st.markdown(f"**{sec}**")
+                        sec_items = items_df[items_df["seccion"] == sec]
+                        for _, it in sec_items.iterrows():
+                            resp_v = it["respuesta"]
+                            badge = f'<span class="badge-cumple">C</span>' if resp_v == "C" else (
+                                    f'<span class="badge-nocumple">NC</span>' if resp_v == "NC" else
+                                    f'<span class="badge-na">N/A</span>')
+                            obs_txt = f" — <em>{it['observacion_item']}</em>" if it.get("observacion_item") else ""
+                            st.markdown(
+                                f'<div class="item-pregunta">{badge} {it["pregunta"]}{obs_txt}</div>',
+                                unsafe_allow_html=True
+                            )
+
+                bc1, bc2 = st.columns(2)
+                with bc2:
+                    if st.button("🗑️ Eliminar Inspección", key=f"del_{vid}"):
+                        db.eliminar_inspeccion(vid)
+                        st.success("Inspección eliminada.")
+                        st.rerun()
         else:
-            st.warning("No hay registros con los filtros seleccionados.")
+            st.warning("No hay inspecciones con los filtros seleccionados.")
 
-    # ===================== TAB 2: DASHBOARD =====================
-    with tab2:
+    # ======================== TAB 3: DASHBOARD ========================
+    with tab3:
         st.markdown("### 📊 Dashboard de Inspecciones")
 
         try:
             import plotly.express as px
             import plotly.graph_objects as go
 
-            df_dash = df_raw.copy()
-            fecha_col_dash = "fecha" if ("fecha" in df_dash.columns and df_dash["fecha"].notna().any()) else "marca_temporal"
+            rango = st.date_input(
+                "Período",
+                value=(datetime.now().replace(day=1), datetime.now()),
+                key="dash_rango"
+            )
+            if not (isinstance(rango, (list, tuple)) and len(rango) == 2):
+                st.info("Selecciona un rango de fechas completo.")
+                return
+
+            df_s = db.stats_dashboard(rango[0], rango[1])
+
+            if df_s.empty:
+                st.info("No hay datos en este período.")
+                return
+
+            total = len(df_s)
+            aprobadas = len(df_s[df_s["porcentaje_cumplimiento"] >= 80])
+            con_obs   = len(df_s[df_s["porcentaje_cumplimiento"] < 80])
+            pct_prom  = df_s["porcentaje_cumplimiento"].mean()
+            total_nc  = df_s["items_no_cumple"].sum()
+
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("🔧 Total Inspecciones", total)
+            k2.metric("✅ Aprobadas (≥80%)", aprobadas)
+            k3.metric("❌ Con Observaciones", con_obs)
+            k4.metric("📊 % Promedio", f"{pct_prom:.1f}%")
+            k5.metric("⚠️ Total NC Detectados", int(total_nc))
+
+            st.divider()
 
             g1, g2 = st.columns(2)
-
             with g1:
-                st.markdown("#### Distribución por Estado")
-                if "_estado" in df_dash.columns:
-                    est_c = df_dash["_estado"].value_counts().reset_index()
-                    est_c.columns = ["estado", "cantidad"]
-                    colores = {
-                        "✅ Sin Fallas": "#27ae60",
-                        "⚠️ Fallas Menores": "#f39c12",
-                        "❌ Fallas Críticas": "#e74c3c"
-                    }
-                    fig1 = px.pie(est_c, values="cantidad", names="estado", hole=0.45,
-                                  color="estado", color_discrete_map=colores)
-                    fig1.update_layout(margin=dict(t=20, b=10), height=300)
-                    st.plotly_chart(fig1, use_container_width=True)
+                st.markdown("#### Cumplimiento por Máquina")
+                df_maq = df_s.groupby("maquina")["porcentaje_cumplimiento"].mean().reset_index().sort_values("porcentaje_cumplimiento")
+                fig1 = px.bar(df_maq, x="porcentaje_cumplimiento", y="maquina", orientation="h",
+                              color="porcentaje_cumplimiento",
+                              color_continuous_scale=["#e74c3c", "#f39c12", "#2ecc71"],
+                              range_color=[0, 100],
+                              text=df_maq["porcentaje_cumplimiento"].apply(lambda x: f"{x:.1f}%"))
+                fig1.update_traces(textposition="outside")
+                fig1.update_layout(margin=dict(t=10, b=10), height=350,
+                                   coloraxis_showscale=False,
+                                   xaxis_title="% Cumplimiento", yaxis_title="",
+                                   xaxis_range=[0, 115])
+                st.plotly_chart(fig1, use_container_width=True)
 
             with g2:
                 st.markdown("#### Inspecciones por Día")
-                if fecha_col_dash in df_dash.columns:
-                    df_dia = df_dash.groupby(df_dash[fecha_col_dash].dt.date).size().reset_index(name="inspecciones")
-                    df_dia.columns = ["fecha", "inspecciones"]
-                    fig2 = px.bar(df_dia, x="fecha", y="inspecciones",
-                                  color_discrete_sequence=["#2c5364"], text="inspecciones")
-                    fig2.update_traces(textposition="outside")
-                    fig2.update_layout(margin=dict(t=20, b=10), height=300,
-                                       xaxis_title="", yaxis_title="Inspecciones")
-                    st.plotly_chart(fig2, use_container_width=True)
+                df_dia = df_s.groupby("fecha").size().reset_index(name="inspecciones")
+                fig2 = px.bar(df_dia, x="fecha", y="inspecciones",
+                              color_discrete_sequence=["#0f3460"], text="inspecciones")
+                fig2.update_traces(textposition="outside")
+                fig2.update_layout(margin=dict(t=10, b=10), height=350,
+                                   xaxis_title="", yaxis_title="Inspecciones")
+                st.plotly_chart(fig2, use_container_width=True)
 
             st.divider()
 
             g3, g4 = st.columns(2)
-
             with g3:
-                st.markdown("#### 🔴 Top Fallas por Ítem")
-                fallas_data = []
-                for label, short in ITEMS_INSPECCION.items():
-                    if short in df_dash.columns:
-                        cnt = df_dash[short].apply(es_falla).sum()
-                        if cnt > 0:
-                            fallas_data.append({"Ítem": label, "Fallas": int(cnt)})
-                if fallas_data:
-                    df_fallas = pd.DataFrame(fallas_data).sort_values("Fallas", ascending=True).tail(15)
-                    fig3 = px.bar(df_fallas, x="Fallas", y="Ítem", orientation="h",
-                                  color="Fallas", color_continuous_scale="Reds", text="Fallas")
-                    fig3.update_traces(textposition="outside")
-                    fig3.update_layout(margin=dict(t=20, b=10), height=max(300, len(df_fallas)*30),
-                                       coloraxis_showscale=False, yaxis_title="", xaxis_title="N° Fallas")
-                    st.plotly_chart(fig3, use_container_width=True)
-                else:
-                    st.success("✅ Sin fallas registradas en el período.")
+                st.markdown("#### Tendencia de Cumplimiento")
+                df_trend = df_s.groupby("fecha")["porcentaje_cumplimiento"].mean().reset_index()
+                fig3 = px.line(df_trend, x="fecha", y="porcentaje_cumplimiento",
+                               markers=True, line_shape="spline",
+                               color_discrete_sequence=["#f5a623"])
+                fig3.add_hline(y=80, line_dash="dash", line_color="red",
+                               annotation_text="Mín 80%", annotation_position="bottom right")
+                fig3.update_layout(margin=dict(t=10, b=10), height=300,
+                                   yaxis_range=[0, 105],
+                                   xaxis_title="", yaxis_title="% Cumplimiento")
+                st.plotly_chart(fig3, use_container_width=True)
 
             with g4:
-                st.markdown("#### Inspecciones por Placa")
-                if "placa" in df_dash.columns:
-                    df_placa = df_dash.groupby("placa").agg(
-                        total=("placa","count"),
-                        fallas=("_fallas_count","sum") if "_fallas_count" in df_dash.columns else ("placa","count")
-                    ).reset_index().sort_values("total", ascending=True)
-                    fig4 = px.bar(df_placa, x="total", y="placa", orientation="h",
-                                  color="total", color_continuous_scale="Blues", text="total")
-                    fig4.update_traces(textposition="outside")
-                    fig4.update_layout(margin=dict(t=20, b=10), height=max(280, len(df_placa)*35),
-                                       coloraxis_showscale=False, yaxis_title="", xaxis_title="Inspecciones")
+                st.markdown("#### NC por Sección")
+                df_s2 = db.obtener_inspecciones(rango[0], rango[1])
+                nc_sec = {}
+                for _, fi_row in df_s2.iterrows():
+                    items_d = db.obtener_items_inspeccion(int(fi_row["id"]))
+                    if not items_d.empty:
+                        nc = items_d[items_d["respuesta"] == "NC"]
+                        for _, r in nc.iterrows():
+                            sec = str(r["seccion"])
+                            nc_sec[sec] = nc_sec.get(sec, 0) + 1
+                if nc_sec:
+                    df_nc_sec = pd.DataFrame(list(nc_sec.items()), columns=["Sección", "NC"])
+                    fig4 = px.pie(df_nc_sec, values="NC", names="Sección", hole=0.4,
+                                  color_discrete_sequence=["#e74c3c", "#f39c12", "#3498db", "#2ecc71"])
+                    fig4.update_layout(margin=dict(t=10, b=10), height=300)
                     st.plotly_chart(fig4, use_container_width=True)
-
-            st.divider()
-
-            g5, g6 = st.columns(2)
-
-            with g5:
-                st.markdown("#### 📅 Inspecciones por Día de Semana")
-                if fecha_col_dash in df_dash.columns:
-                    orden = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-                    df_dash["_dia"] = df_dash[fecha_col_dash].dt.day_name()
-                    df_sem = df_dash.groupby("_dia").size().reset_index(name="inspecciones")
-                    df_sem["orden"] = df_sem["_dia"].map({d: i for i, d in enumerate(orden)})
-                    df_sem = df_sem.sort_values("orden")
-                    df_sem["dia_es"] = df_sem["_dia"].map(DIAS_ES)
-                    fig5 = px.bar(df_sem, x="dia_es", y="inspecciones",
-                                  color="inspecciones", color_continuous_scale="Teal", text="inspecciones")
-                    fig5.update_traces(textposition="outside")
-                    fig5.update_layout(margin=dict(t=20, b=10), height=300,
-                                       coloraxis_showscale=False, xaxis_title="", yaxis_title="")
-                    st.plotly_chart(fig5, use_container_width=True)
-
-            with g6:
-                st.markdown("#### 🏆 Ranking Conductores")
-                if "conductor" in df_dash.columns and "_estado" in df_dash.columns:
-                    df_cond = df_dash[df_dash["conductor"].notna() & (df_dash["conductor"] != "")].groupby("conductor").agg(
-                        total=("conductor","count"),
-                        sin_fallas=("_estado", lambda x: (x=="✅ Sin Fallas").sum()),
-                        fallas_crit=("_estado", lambda x: x.str.contains("Críticas",na=False).sum()),
-                    ).reset_index()
-                    df_cond["% OK"] = (df_cond["sin_fallas"] / df_cond["total"] * 100).round(1)
-                    df_cond = df_cond.sort_values("total", ascending=False)
-                    df_cond.columns = ["Conductor","Total","Sin Fallas","Críticas","% OK"]
-                    st.dataframe(df_cond, use_container_width=True, hide_index=True)
-
-            st.divider()
-
-            # ── Reporte Mensual de Conductores ──
-            st.markdown("---")
-            st.markdown("## 👥 Reporte Mensual de Conductores")
-
-            if "conductor" in df_dash.columns and fecha_col_dash in df_dash.columns:
-                meses_disponibles = (
-                    df_dash[fecha_col_dash]
-                    .dropna()
-                    .apply(lambda x: (x.year, x.month))
-                    .drop_duplicates()
-                    .sort_values(ascending=False)
-                    .tolist()
-                )
-                if meses_disponibles:
-                    opciones_mes = [f"{MESES_ES[m]} {y}" for y, m in meses_disponibles]
-                    mes_sel_label = st.selectbox("📅 Seleccionar mes:", opciones_mes)
-                    idx_mes = opciones_mes.index(mes_sel_label)
-                    anio_sel, mes_sel = meses_disponibles[idx_mes]
-
-                    df_mes = df_dash[
-                        (df_dash[fecha_col_dash].dt.year  == anio_sel) &
-                        (df_dash[fecha_col_dash].dt.month == mes_sel)
-                    ].copy()
-
-                    if df_mes.empty:
-                        st.info("No hay inspecciones en este mes.")
-                    else:
-                        tot_mes         = len(df_mes)
-                        cond_unicos     = df_mes["conductor"].nunique()
-                        placas_unicas   = df_mes["placa"].nunique() if "placa" in df_mes.columns else 0
-                        dias_con_insp   = df_mes[fecha_col_dash].dt.date.nunique()
-
-                        km1, km2, km3, km4 = st.columns(4)
-                        km1.metric("📋 Inspecciones del mes", tot_mes)
-                        km2.metric("👤 Conductores activos",  cond_unicos)
-                        km3.metric("🚛 Placas inspeccionadas", placas_unicas)
-                        km4.metric("📅 Días con actividad",   dias_con_insp)
-
-                        st.markdown("---")
-                        st.markdown("#### 📋 Detalle por Conductor — Día y Placa")
-
-                        cols_detalle = [c for c in [fecha_col_dash,"conductor","placa","_estado","_fallas_count","observaciones","hallazgos"] if c in df_mes.columns]
-                        df_det = df_mes[cols_detalle].copy()
-                        df_det["_fecha_fmt"] = df_det[fecha_col_dash].apply(
-                            lambda x: x.strftime("%d/%m/%Y") if hasattr(x,"strftime") and not pd.isna(x) else ""
-                        )
-                        df_det["_dia_semana"] = df_det[fecha_col_dash].apply(
-                            lambda x: DIAS_ES.get(x.strftime("%A"), x.strftime("%A")) if hasattr(x,"strftime") and not pd.isna(x) else ""
-                        )
-                        df_tabla_det = df_det[[
-                            "conductor","placa","_fecha_fmt","_dia_semana","_estado","_fallas_count","observaciones"
-                        ] if "observaciones" in df_det.columns else [
-                            "conductor","placa","_fecha_fmt","_dia_semana","_estado","_fallas_count"
-                        ]].rename(columns={
-                            "conductor":      "Conductor",
-                            "placa":          "Placa",
-                            "_fecha_fmt":     "Fecha",
-                            "_dia_semana":    "Día",
-                            "_estado":        "Estado",
-                            "_fallas_count":  "# Fallas",
-                            "observaciones":  "Observaciones",
-                        }).sort_values(["Conductor","Fecha"])
-                        st.dataframe(df_tabla_det, use_container_width=True, hide_index=True)
-
-                        st.markdown("---")
-                        st.markdown("#### 🧑 Resumen por Conductor")
-
-                        grp = df_mes.groupby("conductor", dropna=False)
-                        resumen_cond = []
-                        for cond_nombre, g in grp:
-                            if pd.isna(cond_nombre) or str(cond_nombre).strip() == "":
-                                continue
-                            placas_usadas = sorted(g["placa"].dropna().unique().tolist()) if "placa" in g.columns else []
-                            fechas_insp   = g[fecha_col_dash].dropna().sort_values()
-                            dias_str      = ", ".join([
-                                f"{DIAS_ES.get(f.strftime('%A'), f.strftime('%A'))} {f.strftime('%d/%m')}"
-                                for f in fechas_insp
-                            ])
-                            sin_f_c = (g["_estado"] == "✅ Sin Fallas").sum()     if "_estado" in g.columns else 0
-                            men_c   = g["_estado"].str.contains("Menores",na=False).sum() if "_estado" in g.columns else 0
-                            crit_c  = g["_estado"].str.contains("Críticas",na=False).sum() if "_estado" in g.columns else 0
-                            obs_vals  = g["observaciones"].dropna().astype(str).tolist() if "observaciones" in g.columns else []
-                            obs_clean = [o for o in obs_vals if o.strip() and o.strip().lower() != "nan"]
-                            resumen_cond.append({
-                                "Conductor":          cond_nombre,
-                                "Placas":             " · ".join(placas_usadas) if placas_usadas else "—",
-                                "Días inspeccionados": dias_str if dias_str else "—",
-                                "Total":              len(g),
-                                "Sin Fallas":         int(sin_f_c),
-                                "Fallas Menores":     int(men_c),
-                                "Fallas Críticas":    int(crit_c),
-                                "Observaciones":      " | ".join(obs_clean) if obs_clean else "",
-                            })
-
-                        if resumen_cond:
-                            df_res_cond = pd.DataFrame(resumen_cond).sort_values("Total", ascending=False)
-                            st.dataframe(df_res_cond, use_container_width=True, hide_index=True)
-
-                        st.markdown("---")
-                        st.markdown("#### 📊 Inspecciones por Conductor en el Mes")
-                        if resumen_cond:
-                            df_bar_cond = pd.DataFrame(resumen_cond)[["Conductor","Total","Sin Fallas","Fallas Menores","Fallas Críticas"]]
-                            df_bar_cond = df_bar_cond.sort_values("Total", ascending=True)
-                            fig_cond = go.Figure()
-                            fig_cond.add_trace(go.Bar(name="Sin Fallas",      x=df_bar_cond["Sin Fallas"],      y=df_bar_cond["Conductor"], orientation="h", marker_color="#27ae60"))
-                            fig_cond.add_trace(go.Bar(name="Fallas Menores",   x=df_bar_cond["Fallas Menores"],  y=df_bar_cond["Conductor"], orientation="h", marker_color="#f39c12"))
-                            fig_cond.add_trace(go.Bar(name="Fallas Críticas",  x=df_bar_cond["Fallas Críticas"], y=df_bar_cond["Conductor"], orientation="h", marker_color="#e74c3c"))
-                            fig_cond.update_layout(
-                                barmode="stack",
-                                height=max(300, len(df_bar_cond)*40),
-                                margin=dict(t=20, b=10),
-                                xaxis_title="Inspecciones",
-                                yaxis_title="",
-                                legend=dict(orientation="h", y=1.05)
-                            )
-                            st.plotly_chart(fig_cond, use_container_width=True)
-
-                        st.markdown("---")
-                        # Excel del mes con el nuevo formato
-                        titulo_mes = f"INSPECCIONES — {mes_sel_label.upper()}"
-                        excel_mes = generar_excel_inspeccion(df_mes, titulo_reporte=titulo_mes)
-                        st.download_button(
-                            f"⬇️ Descargar Excel — {mes_sel_label}",
-                            data=excel_mes,
-                            file_name=f"Inspecciones_{mes_sel_label.replace(' ','_')}_{datetime.now(BOGOTA_TZ).strftime('%Y%m%d_%H%M')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
                 else:
-                    st.info("No hay fechas válidas para generar reporte mensual.")
-            else:
-                st.warning("Se requieren columnas de conductor y fecha para el reporte mensual.")
+                    st.info("Sin datos de NC en este período.")
+
+            st.divider()
+
+            st.markdown("#### 🏆 Ranking de Cumplimiento por Operador")
+            df_op = df_s[df_s["operador"].notna() & (df_s["operador"].str.strip() != "")].groupby("operador").agg(
+                inspecciones=("operador", "count"),
+                pct_prom=("porcentaje_cumplimiento", "mean"),
+                nc_total=("items_no_cumple", "sum"),
+            ).reset_index().sort_values("pct_prom", ascending=False)
+            df_op["% Cumplimiento"] = df_op["pct_prom"].apply(lambda x: f"{x:.1f}%")
+            df_op = df_op.rename(columns={"operador": "Operador", "inspecciones": "Inspecciones", "nc_total": "NC Total"})
+            df_op = df_op[["Operador", "Inspecciones", "% Cumplimiento", "NC Total"]]
+            st.dataframe(df_op, use_container_width=True, hide_index=True)
 
         except ImportError:
             st.warning("Instala plotly: `pip install plotly`")
         except Exception as e:
             st.error(f"Error en dashboard: {e}")
-            import traceback; st.code(traceback.format_exc())
-
-    # ===================== TAB 3: DETALLE =====================
-    with tab3:
-        st.markdown("### 🔎 Detalle de Inspección")
-
-        if df_raw.empty:
-            st.warning("No hay datos cargados.")
-            st.stop()
-
-        fecha_col_det = "fecha" if ("fecha" in df_raw.columns and df_raw["fecha"].notna().any()) else "marca_temporal"
-
-        df_raw["_label_sel"] = df_raw.apply(
-            lambda r: (
-                f"{r[fecha_col_det].strftime('%d/%m/%Y') if hasattr(r.get(fecha_col_det), 'strftime') and not pd.isna(r.get(fecha_col_det)) else '—'}"
-                f" | {r.get('placa','—')}"
-                f" | {r.get('conductor','—')}"
-                f" | {r.get('_estado','—')}"
-            ),
-            axis=1
-        )
-
-        sel = st.selectbox("Seleccionar inspección:", df_raw["_label_sel"].tolist())
-        if sel:
-            row = df_raw[df_raw["_label_sel"] == sel].iloc[0]
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("🚛 Placa",       row.get("placa","—"))
-            c2.metric("👤 Conductor",   str(row.get("conductor","—"))[:25])
-            c3.metric("📏 Kilometraje", str(row.get("kilometraje","—")))
-            c4.metric("🚦 Estado",      row.get("_estado","—"))
-
-            fallas_count = int(row.get("_fallas_count", 0)) if not pd.isna(row.get("_fallas_count", 0)) else 0
-            if fallas_count > 0:
-                st.error(f"⚠️ Se encontraron **{fallas_count} ítems con fallas** en esta inspección.")
-            else:
-                st.success("✅ Inspección aprobada — sin fallas detectadas.")
-
-            for grupo, items in GRUPOS_INSPECCION.items():
-                st.markdown(f'<div class="section-title">{grupo}</div>', unsafe_allow_html=True)
-                cols_g = st.columns(3)
-                for i, short in enumerate(items):
-                    label = [k for k,v in ITEMS_INSPECCION.items() if v == short]
-                    label = label[0] if label else short
-                    val = row.get(short, "")
-                    if pd.isna(val) or str(val).strip() == "":
-                        badge = '<span class="badge-na">N/A</span>'
-                    elif es_falla(val):
-                        badge = f'<span class="badge-falla">⚠️ {str(val)[:40]}</span>'
-                    else:
-                        badge = f'<span class="badge-ok">✅ {str(val)[:40]}</span>'
-                    with cols_g[i % 3]:
-                        st.markdown(f"**{label}**<br>{badge}", unsafe_allow_html=True)
-                        st.write("")
-
-            st.markdown('<div class="section-title">📝 Observaciones y Hallazgos</div>', unsafe_allow_html=True)
-            obs_val  = str(row.get("observaciones","")).strip()
-            hall_val = str(row.get("hallazgos","")).strip()
-            cont_val = str(row.get("contaminacion","")).strip()
-
-            if obs_val  and obs_val  != "nan": st.info(f"**Observaciones generales:** {obs_val}")
-            if hall_val and hall_val != "nan": st.warning(f"**Hallazgos:** {hall_val}")
-            if cont_val and cont_val.lower() not in ["nan","no","no."]:
-                st.error(f"🚨 **Contaminación/Situación inusual:** {cont_val}")
 
 
 if __name__ == "__main__":
