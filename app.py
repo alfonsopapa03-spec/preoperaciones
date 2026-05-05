@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 # ==================== CREDENCIALES ====================
-SUPABASE_DB_URL = "postgresql://postgres.scjqqcrkjdavetdyxtrf:DN-3QM7ty9Y4LsT@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
+SUPABASE_DB_URL = "postgresql://postgres.scjqqcrkjdavetdyxtrf:DN-GV69W?B8v$x4wH?@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
 
 # ==================== CATÁLOGO DE MÁQUINAS ====================
 # ⚙️ CAMBIA AQUÍ LOS NOMBRES REALES DE TUS 11 MÁQUINAS
