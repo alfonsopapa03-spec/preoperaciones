@@ -1,1142 +1,2235 @@
+"""
+Sistema de Registro y Legalización de Anticipos - Transporte de Carga
+Colombia - Conectado a Supabase (PostgreSQL)
+v17:
+  - Observaciones del viaje visibles en tabla Historial
+  - Observaciones del viaje visibles en expander de Legalizar anticipos
+  - Observaciones del viaje visibles en "Acciones sobre un viaje"
+  - Fechas mostradas en formato DD/MM/YYYY
+  - Períodos con vacaciones tomadas pero SIN pago en dinero → 🟡 advertencia (no verde)
+  - Pago en dinero registrado → 💵 info (no marca como completado; indica que aún faltan vacaciones físicas)
+  - NUEVO: Editar fecha de ingreso de conductores directamente desde la tabla de fechas registradas
+  - NUEVO: Botón "Registrar/Editar pago en dinero" siempre visible en TODOS los períodos
+"""
+
 import streamlit as st
 import psycopg2
-from psycopg2 import pool as pg_pool
+from psycopg2 import pool
 import pandas as pd
 from datetime import datetime, timedelta, date
-import io
+from math import floor
+from io import BytesIO
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-import pytz
 
 # ==================== CONFIGURACIÓN ====================
-st.set_page_config(
-    page_title="Inspecciones Preoperacionales",
-    layout="wide",
-    page_icon="🔧",
-    initial_sidebar_state="collapsed"
-)
+SUPABASE_DB_URL = "postgresql://postgres.ntnpckmbyfmjhfskfwyu:Conejito100#@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
+DIAS_VACACIONES_ANUALES = 15
 
-# ==================== CREDENCIALES ====================
-# ⚠️ Recomendado: mover a st.secrets o variables de entorno en producción
-SUPABASE_DB_URL = "postgresql://postgres.ogfenizdijcboekqhuhd:Conejito200$@aws-1-us-west-2.pooler.supabase.com:6543/postgres"
+# ==================== FORMATO COLOMBIANO ====================
+def fmt(valor):
+    if valor is None:
+        return "0"
+    try:
+        return f"{int(float(valor)):,}".replace(',', '.')
+    except:
+        return str(valor)
 
-# ==================== CATÁLOGO DE MÁQUINAS ====================
-MAQUINAS = [
-    "Máquina 1", "Máquina 2", "Máquina 3", "Máquina 4", "Máquina 5",
-    "Máquina 6", "Máquina 7", "Máquina 8", "Máquina 9", "Máquina 10", "Máquina 11",
+def limpiar(texto):
+    if not texto:
+        return 0.0
+    try:
+        return float(str(texto).replace('.', '').replace(',', '.'))
+    except:
+        return 0.0
+
+def hora_colombia():
+    return datetime.utcnow() - timedelta(hours=5)
+
+def fmt_fecha(valor):
+    """Formatea una fecha o string de fecha a DD/MM/YYYY."""
+    if valor is None:
+        return "—"
+    try:
+        if isinstance(valor, (date, datetime)):
+            return valor.strftime('%d/%m/%Y')
+        return pd.to_datetime(valor).strftime('%d/%m/%Y')
+    except:
+        return str(valor)[:10]
+
+# ==================== CONNECTION POOL (singleton) ====================
+@st.cache_resource
+def get_pool():
+    return psycopg2.pool.ThreadedConnectionPool(
+        minconn=1,
+        maxconn=5,
+        dsn=SUPABASE_DB_URL,
+        connect_timeout=10,
+        options="-c statement_timeout=15000"
+    )
+
+def get_conn():
+    return get_pool().getconn()
+
+def put_conn(conn):
+    get_pool().putconn(conn)
+
+# ==================== ALERTAS ANTICIPOS ====================
+def clasificar_alerta(fecha_viaje):
+    hoy = hora_colombia().date()
+    try:
+        fv = fecha_viaje.date() if hasattr(fecha_viaje, 'date') else pd.to_datetime(fecha_viaje).date()
+    except:
+        return 0, "ok"
+    dias = (hoy - fv).days
+    if dias <= 3:
+        return dias, "ok"
+    elif dias <= 7:
+        return dias, "warning"
+    else:
+        return dias, "critical"
+
+def badge_alerta(dias, nivel):
+    if nivel == "critical":
+        return f"🔴 {dias}d"
+    elif nivel == "warning":
+        return f"🟡 {dias}d"
+    else:
+        return f"🟢 {dias}d"
+
+# ==================== LÓGICA VACACIONES v16 ====================
+
+def calcular_vacaciones(conductor: str, fecha_ingreso: date, df_vac: pd.DataFrame, hoy: date) -> dict:
+    anios_completos = 0
+    periodos = []
+
+    n = 1
+    while True:
+        try:
+            inicio_periodo = fecha_ingreso.replace(year=fecha_ingreso.year + (n - 1))
+        except ValueError:
+            inicio_periodo = date(fecha_ingreso.year + (n - 1), fecha_ingreso.month, 28)
+        try:
+            fin_periodo = fecha_ingreso.replace(year=fecha_ingreso.year + n)
+        except ValueError:
+            fin_periodo = date(fecha_ingreso.year + n, fecha_ingreso.month, 28)
+
+        if fin_periodo > hoy:
+            proxima_fecha = fin_periodo
+            break
+
+        periodos.append({
+            "anio": n,
+            "inicio": inicio_periodo,
+            "fin": fin_periodo,
+            "label": f"Año {n}  ({inicio_periodo.strftime('%d/%m/%Y')} → {fin_periodo.strftime('%d/%m/%Y')})",
+        })
+        anios_completos = n
+        n += 1
+
+    if anios_completos == 0:
+        try:
+            proxima_fecha = fecha_ingreso.replace(year=fecha_ingreso.year + 1)
+        except ValueError:
+            proxima_fecha = date(fecha_ingreso.year + 1, fecha_ingreso.month, 28)
+
+    dias_generados = anios_completos * DIAS_VACACIONES_ANUALES
+
+    vac_cond = df_vac[df_vac["conductor"] == conductor] if not df_vac.empty else pd.DataFrame()
+    dias_usados = int(vac_cond["dias"].sum()) if not vac_cond.empty else 0
+    dias_disponibles = dias_generados - dias_usados
+    dias_vencidos = max(0, dias_disponibles)
+
+    dias_para_proxima = (proxima_fecha - hoy).days
+
+    return {
+        "anios_completos": anios_completos,
+        "dias_generados": dias_generados,
+        "dias_usados": dias_usados,
+        "dias_disponibles": dias_disponibles,
+        "dias_vencidos": dias_vencidos,
+        "proxima_fecha": proxima_fecha,
+        "dias_para_proxima": dias_para_proxima,
+        "periodos": periodos,
+        "registros": vac_cond.to_dict("records") if not vac_cond.empty else [],
+    }
+
+
+# ==================== EXPORTAR EXCEL ANTICIPOS ====================
+def generar_excel(df: pd.DataFrame, titulo: str = "Anticipos") -> BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Anticipos"
+    color_header   = "1F4E79"
+    color_critico  = "FCE4EC"
+    color_warning  = "FFF9C4"
+    color_ok       = "E8F5E9"
+    color_leg      = "E3F2FD"
+    color_subtotal = "BBDEFB"
+    font_header = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+    font_titulo = Font(name="Arial", bold=True, size=13, color="1F4E79")
+    font_normal = Font(name="Arial", size=9)
+    font_bold   = Font(name="Arial", bold=True, size=9)
+    font_red    = Font(name="Arial", bold=True, size=9, color="C62828")
+    font_subtot = Font(name="Arial", bold=True, size=10, color="1F4E79")
+    thin   = Side(style="thin", color="BDBDBD")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left   = Alignment(horizontal="left",   vertical="center")
+    ws.merge_cells("A1:M1")
+    ws["A1"] = f"Reporte de Anticipos — {titulo}"
+    ws["A1"].font = font_titulo
+    ws["A1"].alignment = center
+    ws.merge_cells("A2:M2")
+    ws["A2"] = f"Generado: {hora_colombia().strftime('%d/%m/%Y %H:%M')} (hora Colombia)"
+    ws["A2"].font = Font(name="Arial", size=9, italic=True, color="757575")
+    ws["A2"].alignment = center
+    columnas = ["ID","Manifiesto","Fecha viaje","Placa","Conductor","Cliente","Origen","Destino",
+                "Anticipo (COP)","Estado","Días pend.","Legalizado por","Fecha legalización"]
+    row_header = 4
+    for col_idx, col_name in enumerate(columnas, start=1):
+        cell = ws.cell(row=row_header, column=col_idx, value=col_name)
+        cell.font = font_header
+        cell.fill = PatternFill("solid", fgColor=color_header)
+        cell.alignment = center
+        cell.border = border
+    for row_idx, (_, row) in enumerate(df.iterrows(), start=row_header + 1):
+        legalizado = bool(row.get("legalizado", False))
+        dias, nivel = clasificar_alerta(row.get("fecha_viaje"))
+        if legalizado:
+            row_color = color_leg
+        elif nivel == "critical":
+            row_color = color_critico
+        elif nivel == "warning":
+            row_color = color_warning
+        else:
+            row_color = color_ok
+        fill = PatternFill("solid", fgColor=row_color)
+        valores = [
+            row.get("id",""), row.get("manifiesto",""),
+            str(row.get("fecha_viaje",""))[:10], row.get("placa",""),
+            row.get("conductor",""), row.get("cliente",""),
+            row.get("origen",""), row.get("destino",""),
+            int(row.get("valor_anticipo",0)),
+            "Legalizado" if legalizado else "Pendiente",
+            "" if legalizado else dias,
+            row.get("legalizado_por","") or "",
+            str(row.get("fecha_legalizacion","") or "")[:16],
+        ]
+        for col_idx, valor in enumerate(valores, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=valor)
+            cell.fill = fill; cell.border = border
+            cell.alignment = center if col_idx in [1,10,11] else left
+            if col_idx == 9 and not legalizado and nivel == "critical":
+                cell.font = font_red
+            elif col_idx == 9:
+                cell.font = font_bold
+            else:
+                cell.font = font_normal
+    total_row = row_header + len(df) + 2
+    ws.cell(row=total_row, column=8, value="TOTAL ANTICIPOS:").font = font_subtot
+    ws.cell(row=total_row, column=8).alignment = Alignment(horizontal="right")
+    ws.cell(row=total_row, column=9, value=f'=SUM(I{row_header+1}:I{row_header+len(df)})').font = font_subtot
+    ws.cell(row=total_row, column=9).fill = PatternFill("solid", fgColor=color_subtotal)
+    ws.cell(row=total_row, column=9).border = border
+    ws.cell(row=total_row, column=9).alignment = center
+    anchos = [6,14,13,10,22,20,18,18,18,16,10,22,20]
+    for col_idx, ancho in enumerate(anchos, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = ancho
+    for row_idx in range(row_header+1, row_header+len(df)+1):
+        ws.cell(row=row_idx, column=9).number_format = '#,##0'
+    ws.freeze_panes = f"A{row_header + 1}"
+    output = BytesIO(); wb.save(output); output.seek(0)
+    return output
+
+
+# ==================== EXPORTAR EXCEL PRÉSTAMOS ====================
+def generar_excel_prestamos(df_prestamos: pd.DataFrame, df_pagos: pd.DataFrame) -> BytesIO:
+    wb = Workbook()
+    ws1 = wb.active
+    ws1.title = "Préstamos"
+    color_h    = "1F4E79"
+    color_paz  = "E8F5E9"
+    color_deu  = "FCE4EC"
+    fh  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+    fn  = Font(name="Arial", size=9)
+    ft  = Font(name="Arial", bold=True, size=13, color="1F4E79")
+    thin   = Side(style="thin", color="BDBDBD")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left_a = Alignment(horizontal="left",   vertical="center")
+    ws1.merge_cells("A1:I1")
+    ws1["A1"] = f"Reporte de Préstamos — {hora_colombia().strftime('%d/%m/%Y %H:%M')}"
+    ws1["A1"].font = ft; ws1["A1"].alignment = center
+    cols_prest = ["ID","Conductor","Fecha préstamo","Monto total","Total pagado","Saldo pendiente","Estado","Motivo","Observaciones"]
+    rh = 3
+    for ci, cn in enumerate(cols_prest, 1):
+        cell = ws1.cell(row=rh, column=ci, value=cn)
+        cell.font = fh
+        cell.fill = PatternFill("solid", fgColor=color_h)
+        cell.alignment = center; cell.border = border
+    for ri, (_, row) in enumerate(df_prestamos.iterrows(), start=rh+1):
+        paz = row.get("estado","") == "saldado"
+        fill = PatternFill("solid", fgColor=color_paz if paz else color_deu)
+        pid = row.get("id",0)
+        pagos_conductor = df_pagos[df_pagos["prestamo_id"]==pid]["monto_pago"].sum() if not df_pagos.empty else 0
+        saldo = max(0, int(row.get("monto_total",0)) - int(pagos_conductor))
+        valores = [
+            pid, row.get("conductor",""),
+            str(row.get("fecha_prestamo",""))[:10],
+            int(row.get("monto_total",0)),
+            int(pagos_conductor), saldo,
+            "Paz y salvo" if paz else "Pendiente",
+            row.get("motivo","") or "", row.get("observaciones","") or ""
+        ]
+        for ci, val in enumerate(valores, 1):
+            cell = ws1.cell(row=ri, column=ci, value=val)
+            cell.fill = fill; cell.border = border; cell.font = fn
+            cell.alignment = center if ci in [1,4,5,6,7] else left_a
+            if ci in [4,5,6]: cell.number_format = '#,##0'
+    anchos1 = [6,22,14,16,16,16,14,22,28]
+    for ci, aw in enumerate(anchos1, 1):
+        ws1.column_dimensions[get_column_letter(ci)].width = aw
+    ws1.freeze_panes = f"A{rh+1}"
+
+    if not df_pagos.empty:
+        ws2 = wb.create_sheet("Detalle pagos")
+        ws2.merge_cells("A1:F1")
+        ws2["A1"] = "Detalle de pagos / descuentos"
+        ws2["A1"].font = ft; ws2["A1"].alignment = center
+        cols_pago = ["ID pago","Préstamo ID","Conductor","Fecha pago","Monto descuento","Observaciones"]
+        rh2 = 3
+        for ci, cn in enumerate(cols_pago, 1):
+            cell = ws2.cell(row=rh2, column=ci, value=cn)
+            cell.font = fh
+            cell.fill = PatternFill("solid", fgColor=color_h)
+            cell.alignment = center; cell.border = border
+        for ri, (_, row) in enumerate(df_pagos.iterrows(), start=rh2+1):
+            fill2 = PatternFill("solid", fgColor="F3F3F3")
+            pid2 = row.get("prestamo_id",0)
+            cond2 = ""
+            if not df_prestamos.empty:
+                match = df_prestamos[df_prestamos["id"]==pid2]
+                if not match.empty:
+                    cond2 = match.iloc[0].get("conductor","")
+            valores2 = [
+                row.get("id",""), pid2, cond2,
+                str(row.get("fecha_pago",""))[:10],
+                int(row.get("monto_pago",0)),
+                row.get("observaciones","") or ""
+            ]
+            for ci, val in enumerate(valores2, 1):
+                cell = ws2.cell(row=ri, column=ci, value=val)
+                cell.fill = fill2; cell.border = border; cell.font = fn
+                cell.alignment = center if ci in [1,2,4,5] else left_a
+                if ci == 5: cell.number_format = '#,##0'
+        anchos2 = [8,12,22,14,18,30]
+        for ci, aw in enumerate(anchos2, 1):
+            ws2.column_dimensions[get_column_letter(ci)].width = aw
+        ws2.freeze_panes = f"A{rh2+1}"
+
+    output = BytesIO(); wb.save(output); output.seek(0)
+    return output
+
+
+# ==================== EXPORTAR EXCEL VACACIONES v16 ====================
+def generar_excel_vacaciones(df_info: pd.DataFrame, df_vac: pd.DataFrame, df_pagos_vac: pd.DataFrame, conductores: list) -> BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Resumen vacaciones"
+    color_h    = "1F4E79"
+    color_venc = "FCE4EC"
+    color_ok_  = "E8F5E9"
+    color_pag  = "E3F2FD"
+    fh = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+    fn = Font(name="Arial", size=9)
+    ft = Font(name="Arial", bold=True, size=13, color="1F4E79")
+    thin   = Side(style="thin", color="BDBDBD")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left_a = Alignment(horizontal="left",   vertical="center")
+    ws.merge_cells("A1:J1")
+    ws["A1"] = f"Reporte de Vacaciones — {hora_colombia().strftime('%d/%m/%Y %H:%M')}"
+    ws["A1"].font = ft; ws["A1"].alignment = center
+
+    cols = [
+        "Conductor", "Fecha ingreso", "Años completos",
+        "Días generados (×15)", "Días usados",
+        "Días pendientes", "Estado",
+        "Próxima vacación", "Días para próxima"
+    ]
+    rh = 3
+    for ci, cn in enumerate(cols, 1):
+        cell = ws.cell(row=rh, column=ci, value=cn)
+        cell.font = fh
+        cell.fill = PatternFill("solid", fgColor=color_h)
+        cell.alignment = center; cell.border = border
+
+    hoy = hora_colombia().date()
+    for ri, cond in enumerate(sorted(conductores), start=rh+1):
+        info_row = df_info[df_info["conductor"] == cond].iloc[0] \
+            if not df_info.empty and (df_info["conductor"] == cond).any() else None
+
+        if info_row is not None and info_row.get("fecha_ingreso") is not None:
+            fi = pd.to_datetime(info_row["fecha_ingreso"]).date()
+            calc = calcular_vacaciones(cond, fi, df_vac, hoy)
+
+            pagos_cond = df_pagos_vac[df_pagos_vac["conductor"] == cond] if not df_pagos_vac.empty else pd.DataFrame()
+            anios_pagados = set(pagos_cond["anio_laboral"].tolist()) if not pagos_cond.empty else set()
+            periodos_pendientes_sin_pago = sum(
+                1 for p in calc["periodos"]
+                if p["anio"] not in anios_pagados
+                and (DIAS_VACACIONES_ANUALES - sum(
+                    int(r.get("dias", 0)) for r in calc["registros"]
+                    if r.get("fecha_inicio") is not None and (
+                        pd.to_datetime(r["fecha_inicio"]).date() >= p["inicio"]
+                        and pd.to_datetime(r["fecha_inicio"]).date() < p["fin"]
+                    )
+                )) > 0
+            )
+
+            if periodos_pendientes_sin_pago > 0:
+                estado_txt = "Con días pendientes"
+                fill_color = color_venc
+            elif calc["anios_completos"] > 0:
+                estado_txt = "Al día / Pagado"
+                fill_color = color_ok_
+            else:
+                estado_txt = "Sin períodos aún"
+                fill_color = color_ok_
+
+            valores = [
+                cond, str(fi),
+                calc["anios_completos"],
+                calc["dias_generados"],
+                calc["dias_usados"],
+                calc["dias_vencidos"],
+                estado_txt,
+                str(calc["proxima_fecha"]),
+                calc["dias_para_proxima"],
+            ]
+        else:
+            fill_color = "F3F3F3"
+            valores = [cond, "—", "—", "—", "—", "—", "Sin fecha ingreso", "—", "—"]
+
+        fill = PatternFill("solid", fgColor=fill_color)
+        for ci, val in enumerate(valores, 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.fill = fill; cell.border = border; cell.font = fn
+            cell.alignment = center if ci in [3,4,5,6,9] else left_a
+
+    anchos = [28, 14, 16, 18, 14, 16, 20, 16, 18]
+    for ci, aw in enumerate(anchos, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = aw
+    ws.freeze_panes = f"A{rh+1}"
+
+    ws2 = wb.create_sheet("Historial tomadas")
+    ws2.merge_cells("A1:G1")
+    ws2["A1"] = "Historial de vacaciones tomadas por conductor"
+    ws2["A1"].font = ft; ws2["A1"].alignment = center
+    cols2 = ["Conductor", "Fecha inicio", "Fecha fin", "Días", "Observaciones", "Registrado por", "Fecha registro"]
+    for ci, cn in enumerate(cols2, 1):
+        cell = ws2.cell(row=3, column=ci, value=cn)
+        cell.font = fh; cell.fill = PatternFill("solid", fgColor=color_h)
+        cell.alignment = center; cell.border = border
+
+    ri2 = 4
+    if not df_vac.empty:
+        for _, row in df_vac.sort_values(["conductor", "fecha_inicio"]).iterrows():
+            fill2 = PatternFill("solid", fgColor=color_ok_)
+            vals2 = [
+                row.get("conductor",""),
+                str(row.get("fecha_inicio",""))[:10],
+                str(row.get("fecha_fin",""))[:10],
+                row.get("dias",""),
+                row.get("observaciones","") or "",
+                row.get("registrado_por","") or "",
+                str(row.get("fecha_registro",""))[:16],
+            ]
+            for ci, val in enumerate(vals2, 1):
+                cell = ws2.cell(row=ri2, column=ci, value=val)
+                cell.fill = fill2; cell.border = border; cell.font = fn
+                cell.alignment = center if ci in [4] else left_a
+            ri2 += 1
+
+    anchos2 = [28, 14, 12, 8, 28, 20, 18]
+    for ci, aw in enumerate(anchos2, 1):
+        ws2.column_dimensions[get_column_letter(ci)].width = aw
+    ws2.freeze_panes = "A4"
+
+    ws3 = wb.create_sheet("Pagos en dinero")
+    ws3.merge_cells("A1:H1")
+    ws3["A1"] = "Pagos de vacaciones en dinero por período anual"
+    ws3["A1"].font = ft; ws3["A1"].alignment = center
+    cols3 = ["Conductor", "Año laboral", "Período", "Monto pagado (COP)", "Fecha pago", "Registrado por", "Observaciones", "Fecha registro"]
+    for ci, cn in enumerate(cols3, 1):
+        cell = ws3.cell(row=3, column=ci, value=cn)
+        cell.font = fh; cell.fill = PatternFill("solid", fgColor=color_h)
+        cell.alignment = center; cell.border = border
+
+    ri3 = 4
+    if not df_pagos_vac.empty:
+        for _, row in df_pagos_vac.sort_values(["conductor", "anio_laboral"]).iterrows():
+            fill3 = PatternFill("solid", fgColor=color_pag)
+            vals3 = [
+                row.get("conductor",""),
+                row.get("anio_laboral",""),
+                row.get("periodo_label","") or "",
+                int(row.get("monto_cop", 0)),
+                str(row.get("fecha_pago",""))[:10],
+                row.get("registrado_por","") or "",
+                row.get("observaciones","") or "",
+                str(row.get("fecha_registro",""))[:16],
+            ]
+            for ci, val in enumerate(vals3, 1):
+                cell = ws3.cell(row=ri3, column=ci, value=val)
+                cell.fill = fill3; cell.border = border; cell.font = fn
+                cell.alignment = center if ci in [2, 4] else left_a
+                if ci == 4: cell.number_format = '#,##0'
+            ri3 += 1
+
+    anchos3 = [28, 12, 32, 20, 14, 20, 28, 18]
+    for ci, aw in enumerate(anchos3, 1):
+        ws3.column_dimensions[get_column_letter(ci)].width = aw
+    ws3.freeze_panes = "A4"
+
+    output = BytesIO(); wb.save(output); output.seek(0)
+    return output
+
+
+# ==================== PLACAS ====================
+PLACAS = [
+    "NOX459","NOX460","NOX461","SON047","SON048",
+    "SOP148","SOP149","SOP150","SRO661","SRO672",
+    "TMW882","TRL282","TRL298","UYQ308","UYV084",
+    "UYY788","PSX350"
 ]
 
-# ==================== ÍTEMS DE INSPECCIÓN ====================
-ITEMS_ANTES_USO = [
-    "¿Tiene permiso el trabajador para utilizar la máquina?",
-    "¿Ha sido capacitado el trabajador para utilizar la máquina?",
-    "¿Se ha verificado que la presión del aire se encuentre en 125 PSI?",
-    "¿Se ha inspeccionado que los desviadores contengan material adecuadamente?",
-    "¿Se ha inspeccionado que los electro-válvulas funcionen adecuadamente?",
-    "¿Se ha comprobado que los ganchos de ajuste funcionen correctamente?",
-    "¿El 'carrusel' de fricción del material funciona satisfactoriamente?",
-    "¿Se ha verificado que el tope se encuentre en óptimas condiciones?",
-    "¿Se ha inspeccionado que los botones y controles funcionen oportunamente?",
-    "¿Las paradas de emergencia (6 en total) funcionan correctamente?",
-    "¿Se ha verificado el estado de los cabezales (inferior/superior)?",
-    "¿El nivel de aceite de lubricación se encuentra en nivel adecuado?",
-    "¿El manómetro de aceite de sobrecarga funciona correctamente?",
-    "¿Se ha ajustado la altura del panel a la medida correspondiente?",
+CONDUCTORES_DEFAULT = [
+    "CARLOS TAFUR","CHRISTIAN MARTINEZ","EDGAR DE JESUS",
+    "EDUARDO OLIVARES","FLAVIO MALTE","GONZALO","ISAIAS VESGA",
+    "JOSE ORTEGA","JULIAN CALETH","PEDRO JR","RAMON TAFUR",
+    "REIMUR MANUEL","SLITH ORTEGA","YEIMI DUQUE","SIN CONDUCTOR ASIGNADO",
 ]
 
-ITEMS_EPP = [
-    "¿Se ha inspeccionado el lugar de trabajo? (material combustible, riesgo de incendios, instalaciones, otros trabajadores, etc.)",
-    "¿La iluminación del área de trabajo es adecuada para operación de la máquina sin riesgos?",
-    "¿Cuenta con los elementos de protección personal? (protector de ojos, oídos, guantes y cabezado)",
-    "¿El trabajador está vestido apropiadamente? (Camisa manga larga, pantalón de dotación y calzado de seguridad)",
-    "¿Se evidencia el NO uso de joyas, relojes y ropa holgada?",
-    "¿Se tiene el cabello recogido si lo tiene largo?",
+CLIENTES_DEFAULT = [
+    "GLOBO EXPRESS","MOTOTRANSPORTAMOS","CARGO ANDINA","TRANSOLICAR","SUCLOGISTIC",
 ]
-
-ITEMS_ELECTRICA = [
-    "¿Se ha verificado que el cable de alimentación está en buen estado?",
-    "¿Se ha revisado que el enchufe se encuentre en buenas condiciones?",
-    "¿El interruptor de encendido funciona correctamente?",
-]
-
-TODOS_ITEMS = ITEMS_ANTES_USO + ITEMS_EPP + ITEMS_ELECTRICA
-OPCIONES_INSPECCION = ["C", "NC", "N/A"]
-ESTADOS_INSPECCION  = ["✅ Aprobada", "⚠️ Con Observaciones", "❌ Rechazada"]
-
-# ==================== CSS ====================
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700&family=Barlow:wght@300;400;500&display=swap');
-    html, body, [class*="css"] { font-family: 'Barlow', sans-serif; }
-    .main-header {
-        background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
-        padding: 1.5rem 2rem; border-radius: 12px; margin-bottom: 1.5rem;
-    }
-    .main-header h1 {
-        font-family: 'Barlow Condensed', sans-serif;
-        font-size: 2rem; font-weight: 700; color: white; margin: 0; letter-spacing: 1px;
-    }
-    .main-header p { color: #a0c4d8; margin: 0; font-size: 0.9rem; }
-    .seccion-titulo {
-        background: #203a43; color: white; padding: 0.4rem 1rem;
-        border-radius: 6px; font-weight: 700; font-size: 0.95rem;
-        margin: 1rem 0 0.5rem 0; letter-spacing: 0.5px;
-    }
-    .item-label { font-size: 0.85rem; color: #333; padding: 0.3rem 0; }
-    .badge-c   { background: #2ecc71; color: white; border-radius: 4px; padding: 2px 8px; font-weight: 700; font-size: 0.8rem; }
-    .badge-nc  { background: #e74c3c; color: white; border-radius: 4px; padding: 2px 8px; font-weight: 700; font-size: 0.8rem; }
-    .badge-na  { background: #95a5a6; color: white; border-radius: 4px; padding: 2px 8px; font-weight: 700; font-size: 0.8rem; }
-    div[data-testid="stTabs"] button {
-        font-family: 'Barlow Condensed', sans-serif;
-        font-weight: 600; font-size: 1rem; letter-spacing: 0.5px;
-    }
-    .kpi-box {
-        background: white; border-radius: 10px; padding: 1rem 1.2rem;
-        border-left: 5px solid #2c5364; box-shadow: 0 2px 8px rgba(0,0,0,0.07);
-        margin-bottom: 0.5rem;
-    }
-</style>
-""", unsafe_allow_html=True)
 
 
 # ==================== BASE DE DATOS ====================
-@st.cache_resource
-def get_pool():
-    """
-    Crea el pool de conexiones UNA sola vez para toda la sesión de Streamlit.
-    sslmode='require' es obligatorio para Supabase Cloud.
-    """
-    try:
-        connection_pool = pg_pool.SimpleConnectionPool(
-            minconn=1,
-            maxconn=5,
-            dsn=SUPABASE_DB_URL,
-            sslmode="require",
-            connect_timeout=15,
-            options="-c statement_timeout=30000"
-        )
-        return connection_pool
-    except Exception as e:
-        st.error(f"❌ No se pudo conectar a la base de datos: {e}")
-        st.stop()
-
-
 class DB:
-    def __init__(self):
-        self.pool = get_pool()
-        self.init()
-
-    def conn(self):
-        """Obtiene una conexión del pool con reconexión automática."""
+    def _exec(self, query, params=None, fetch=None):
+        conn = get_conn()
         try:
-            c = self.pool.getconn()
-            # Verificar que la conexión sigue activa
-            c.cursor().execute("SELECT 1")
-            return c
-        except Exception:
-            # La conexión estaba muerta: crear una nueva directamente
-            try:
-                return psycopg2.connect(
-                    dsn=SUPABASE_DB_URL,
-                    sslmode="require",
-                    connect_timeout=15,
-                )
-            except Exception as e:
-                st.error(f"❌ Error de conexión: {e}")
-                st.stop()
-
-    def release(self, c):
-        """Devuelve la conexión al pool de forma segura."""
-        try:
-            if c and not c.closed:
-                self.pool.putconn(c)
-        except Exception:
-            pass
-
-    def init(self):
-        c = None
-        try:
-            c = self.conn()
-            cur = c.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS inspecciones_preop (
-                    id SERIAL PRIMARY KEY,
-                    fecha_registro TIMESTAMP DEFAULT (now() AT TIME ZONE 'America/Bogota'),
-                    fecha DATE NOT NULL,
-                    maquina TEXT NOT NULL,
-                    modelo TEXT,
-                    marca TEXT,
-                    placa TEXT,
-                    trabajador TEXT,
-                    revisado_por TEXT,
-                    cliente_proyecto TEXT,
-                    responsable_mantenimiento TEXT,
-                    estado TEXT DEFAULT 'Aprobada',
-                    observaciones TEXT
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS inspecciones_preop_items (
-                    id SERIAL PRIMARY KEY,
-                    inspeccion_id INTEGER REFERENCES inspecciones_preop(id) ON DELETE CASCADE,
-                    seccion TEXT NOT NULL,
-                    item_numero INTEGER NOT NULL,
-                    descripcion TEXT NOT NULL,
-                    resultado TEXT DEFAULT 'C'
-                )
-            """)
-            c.commit()
-            cur.close()
+            cur = conn.cursor()
+            cur.execute(query, params)
+            if fetch == "all":
+                return cur.fetchall(), [d[0] for d in cur.description]
+            elif fetch == "one":
+                return cur.fetchone()
+            else:
+                conn.commit()
+                return True
         except Exception as e:
-            st.error(f"Error inicializando DB: {e}")
+            conn.rollback()
+            st.error(f"DB error: {e}")
+            return None
         finally:
-            self.release(c)
+            put_conn(conn)
 
-    def guardar_inspeccion(self, datos: dict, items: list) -> bool:
-        c = None
+    def _query_df(self, query, params=None):
+        conn = get_conn()
         try:
-            c = self.conn()
-            cur = c.cursor()
+            df = pd.read_sql_query(query, conn, params=params)
+            return df
+        except Exception as e:
+            st.error(f"DB query error: {e}")
+            return pd.DataFrame()
+        finally:
+            put_conn(conn)
+
+    def init_tablas(self):
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
             cur.execute("""
-                INSERT INTO inspecciones_preop
-                (fecha, maquina, modelo, marca, placa, trabajador, revisado_por,
-                 cliente_proyecto, responsable_mantenimiento, estado, observaciones)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                CREATE TABLE IF NOT EXISTS anticipos_v1 (
+                    id SERIAL PRIMARY KEY,
+                    fecha_viaje DATE NOT NULL,
+                    fecha_registro TIMESTAMP NOT NULL,
+                    placa TEXT NOT NULL,
+                    conductor TEXT NOT NULL,
+                    cliente TEXT NOT NULL,
+                    origen TEXT NOT NULL,
+                    destino TEXT NOT NULL,
+                    valor_anticipo BIGINT NOT NULL,
+                    observaciones TEXT,
+                    legalizado BOOLEAN DEFAULT FALSE,
+                    fecha_legalizacion TIMESTAMP,
+                    legalizado_por TEXT,
+                    obs_legalizacion TEXT
+                )
+            """)
+            cur.execute("ALTER TABLE anticipos_v1 ADD COLUMN IF NOT EXISTS manifiesto TEXT DEFAULT ''")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS clientes_extra (
+                    id SERIAL PRIMARY KEY,
+                    nombre TEXT UNIQUE NOT NULL,
+                    fecha_registro TIMESTAMP NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS conductores_extra (
+                    id SERIAL PRIMARY KEY,
+                    nombre TEXT UNIQUE NOT NULL,
+                    fecha_registro TIMESTAMP NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS conductores_info (
+                    id SERIAL PRIMARY KEY,
+                    conductor TEXT UNIQUE NOT NULL,
+                    fecha_ingreso DATE,
+                    observaciones TEXT,
+                    fecha_registro TIMESTAMP NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS vacaciones (
+                    id SERIAL PRIMARY KEY,
+                    conductor TEXT NOT NULL,
+                    fecha_inicio DATE NOT NULL,
+                    fecha_fin DATE NOT NULL,
+                    dias INTEGER NOT NULL,
+                    anio_laboral INTEGER,
+                    observaciones TEXT,
+                    registrado_por TEXT,
+                    fecha_registro TIMESTAMP NOT NULL
+                )
+            """)
+            cur.execute("ALTER TABLE vacaciones ADD COLUMN IF NOT EXISTS anio_laboral INTEGER")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS prestamos (
+                    id SERIAL PRIMARY KEY,
+                    conductor TEXT NOT NULL,
+                    monto_total BIGINT NOT NULL,
+                    fecha_prestamo DATE NOT NULL,
+                    motivo TEXT,
+                    observaciones TEXT,
+                    estado TEXT DEFAULT 'activo',
+                    fecha_registro TIMESTAMP NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pagos_prestamos (
+                    id SERIAL PRIMARY KEY,
+                    prestamo_id INTEGER NOT NULL REFERENCES prestamos(id) ON DELETE CASCADE,
+                    monto_pago BIGINT NOT NULL,
+                    fecha_pago DATE NOT NULL,
+                    observaciones TEXT,
+                    registrado_por TEXT,
+                    fecha_registro TIMESTAMP NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS vacaciones_pagos (
+                    id SERIAL PRIMARY KEY,
+                    conductor TEXT NOT NULL,
+                    anio_laboral INTEGER NOT NULL,
+                    periodo_label TEXT,
+                    monto_cop BIGINT NOT NULL,
+                    fecha_pago DATE NOT NULL,
+                    observaciones TEXT,
+                    registrado_por TEXT,
+                    fecha_registro TIMESTAMP NOT NULL,
+                    UNIQUE (conductor, anio_laboral)
+                )
+            """)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            st.error(f"Error inicializando tablas: {e}")
+        finally:
+            put_conn(conn)
+
+    # ---- Clientes ----
+    def obtener_clientes_extra(self):
+        return self._query_df("SELECT * FROM clientes_extra ORDER BY nombre")
+
+    def agregar_cliente(self, nombre):
+        return bool(self._exec(
+            "INSERT INTO clientes_extra (nombre, fecha_registro) VALUES (%s, %s)",
+            (nombre.strip().upper(), hora_colombia())
+        ))
+
+    def eliminar_cliente(self, cliente_id):
+        self._exec("DELETE FROM clientes_extra WHERE id = %s", (cliente_id,))
+
+    # ---- Conductores extra ----
+    def obtener_conductores_extra(self):
+        return self._query_df("SELECT * FROM conductores_extra ORDER BY nombre")
+
+    def agregar_conductor(self, nombre):
+        return bool(self._exec(
+            "INSERT INTO conductores_extra (nombre, fecha_registro) VALUES (%s, %s)",
+            (nombre.strip().upper(), hora_colombia())
+        ))
+
+    def editar_conductor(self, conductor_id, nombre_nuevo):
+        return bool(self._exec(
+            "UPDATE conductores_extra SET nombre = %s WHERE id = %s",
+            (nombre_nuevo.strip().upper(), conductor_id)
+        ))
+
+    def eliminar_conductor(self, conductor_id):
+        self._exec("DELETE FROM conductores_extra WHERE id = %s", (conductor_id,))
+
+    # ---- Conductores info ----
+    def obtener_info_conductor(self, conductor):
+        df = self._query_df("SELECT * FROM conductores_info WHERE conductor = %s", (conductor,))
+        return df.iloc[0] if not df.empty else None
+
+    def obtener_todos_info_conductores(self):
+        return self._query_df("SELECT * FROM conductores_info ORDER BY conductor")
+
+    def guardar_info_conductor(self, conductor, fecha_ingreso, observaciones=""):
+        return bool(self._exec("""
+            INSERT INTO conductores_info (conductor, fecha_ingreso, observaciones, fecha_registro)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (conductor) DO UPDATE
+            SET fecha_ingreso = EXCLUDED.fecha_ingreso,
+                observaciones = EXCLUDED.observaciones
+        """, (conductor.strip().upper(), fecha_ingreso, observaciones.strip(), hora_colombia())))
+
+    # ---- Vacaciones ----
+    def obtener_vacaciones(self, conductor=None):
+        if conductor:
+            return self._query_df(
+                "SELECT * FROM vacaciones WHERE conductor = %s ORDER BY fecha_inicio DESC",
+                (conductor,)
+            )
+        return self._query_df("SELECT * FROM vacaciones ORDER BY fecha_inicio DESC")
+
+    def registrar_vacacion(self, data):
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO vacaciones (conductor, fecha_inicio, fecha_fin, dias, anio_laboral,
+                    observaciones, registrado_por, fecha_registro)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+            """, (
+                data['conductor'], data['fecha_inicio'], data['fecha_fin'],
+                int(data['dias']), data.get('anio_laboral'),
+                data.get('observaciones',''),
+                data.get('registrado_por','').strip().upper(), hora_colombia()
+            ))
+            nuevo_id = cur.fetchone()[0]
+            conn.commit()
+            return nuevo_id
+        except Exception as e:
+            conn.rollback()
+            st.error(f"Error registrando vacación: {e}")
+            return None
+        finally:
+            put_conn(conn)
+
+    def actualizar_vacacion(self, vac_id, data):
+        return bool(self._exec("""
+            UPDATE vacaciones
+            SET fecha_inicio = %s, fecha_fin = %s, dias = %s, observaciones = %s
+            WHERE id = %s
+        """, (
+            data['fecha_inicio'], data['fecha_fin'],
+            int(data['dias']), data.get('observaciones',''), vac_id
+        )))
+
+    def eliminar_vacacion(self, vac_id):
+        self._exec("DELETE FROM vacaciones WHERE id = %s", (vac_id,))
+
+    # ---- Pagos de vacaciones en dinero (v16) ----
+    def obtener_pagos_vacaciones(self, conductor=None):
+        if conductor:
+            return self._query_df(
+                "SELECT * FROM vacaciones_pagos WHERE conductor = %s ORDER BY anio_laboral",
+                (conductor,)
+            )
+        return self._query_df("SELECT * FROM vacaciones_pagos ORDER BY conductor, anio_laboral")
+
+    def registrar_pago_vacacion(self, data):
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO vacaciones_pagos
+                    (conductor, anio_laboral, periodo_label, monto_cop, fecha_pago,
+                     observaciones, registrado_por, fecha_registro)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (conductor, anio_laboral) DO UPDATE
+                SET monto_cop       = EXCLUDED.monto_cop,
+                    periodo_label   = EXCLUDED.periodo_label,
+                    fecha_pago      = EXCLUDED.fecha_pago,
+                    observaciones   = EXCLUDED.observaciones,
+                    registrado_por  = EXCLUDED.registrado_por,
+                    fecha_registro  = EXCLUDED.fecha_registro
                 RETURNING id
             """, (
-                datos["fecha"], datos["maquina"], datos["modelo"], datos["marca"],
-                datos["placa"], datos["trabajador"], datos["revisado_por"],
-                datos["cliente_proyecto"], datos["responsable_mantenimiento"],
-                datos["estado"], datos["observaciones"],
+                data['conductor'],
+                int(data['anio_laboral']),
+                data.get('periodo_label', ''),
+                int(data['monto_cop']),
+                data['fecha_pago'],
+                data.get('observaciones', '').strip(),
+                data.get('registrado_por', '').strip().upper(),
+                hora_colombia()
             ))
-            inspeccion_id = cur.fetchone()[0]
-            for item in items:
-                cur.execute("""
-                    INSERT INTO inspecciones_preop_items
-                    (inspeccion_id, seccion, item_numero, descripcion, resultado)
-                    VALUES (%s,%s,%s,%s,%s)
-                """, (
-                    inspeccion_id, item["seccion"], item["item_numero"],
-                    item["descripcion"], item["resultado"]
-                ))
-            c.commit()
-            cur.close()
-            return True
+            nuevo_id = cur.fetchone()[0]
+            conn.commit()
+            return nuevo_id
         except Exception as e:
-            st.error(f"Error guardando: {e}")
-            return False
+            conn.rollback()
+            st.error(f"Error registrando pago de vacaciones: {e}")
+            return None
         finally:
-            self.release(c)
+            put_conn(conn)
 
-    def actualizar_inspeccion(self, inspeccion_id: int, datos: dict, items: list) -> bool:
-        c = None
+    def eliminar_pago_vacacion(self, pago_id):
+        self._exec("DELETE FROM vacaciones_pagos WHERE id = %s", (pago_id,))
+
+    # ---- Préstamos ----
+    def obtener_prestamos(self, conductor=None, estado=None):
+        q = "SELECT * FROM prestamos WHERE 1=1"
+        params = []
+        if conductor:
+            q += " AND conductor = %s"; params.append(conductor)
+        if estado and estado != "Todos":
+            q += " AND estado = %s"; params.append(estado)
+        q += " ORDER BY fecha_prestamo DESC, fecha_registro DESC"
+        return self._query_df(q, params if params else None)
+
+    def registrar_prestamo(self, data):
+        conn = get_conn()
         try:
-            c = self.conn()
-            cur = c.cursor()
+            cur = conn.cursor()
             cur.execute("""
-                UPDATE inspecciones_preop SET
-                fecha=%s, maquina=%s, modelo=%s, marca=%s, placa=%s,
-                trabajador=%s, revisado_por=%s, cliente_proyecto=%s,
-                responsable_mantenimiento=%s, estado=%s, observaciones=%s
-                WHERE id=%s
+                INSERT INTO prestamos (conductor, monto_total, fecha_prestamo, motivo, observaciones, estado, fecha_registro)
+                VALUES (%s, %s, %s, %s, %s, 'activo', %s) RETURNING id
             """, (
-                datos["fecha"], datos["maquina"], datos["modelo"], datos["marca"],
-                datos["placa"], datos["trabajador"], datos["revisado_por"],
-                datos["cliente_proyecto"], datos["responsable_mantenimiento"],
-                datos["estado"], datos["observaciones"], inspeccion_id
+                data['conductor'], int(data['monto_total']),
+                data['fecha_prestamo'], data.get('motivo','').strip(),
+                data.get('observaciones','').strip(), hora_colombia()
             ))
-            cur.execute(
-                "DELETE FROM inspecciones_preop_items WHERE inspeccion_id=%s",
-                (inspeccion_id,)
+            nuevo_id = cur.fetchone()[0]
+            conn.commit()
+            return nuevo_id
+        except Exception as e:
+            conn.rollback()
+            st.error(f"Error registrando préstamo: {e}")
+            return None
+        finally:
+            put_conn(conn)
+
+    def eliminar_prestamo(self, prestamo_id):
+        self._exec("DELETE FROM prestamos WHERE id = %s", (prestamo_id,))
+
+    def actualizar_estado_prestamo(self, prestamo_id, estado):
+        self._exec("UPDATE prestamos SET estado = %s WHERE id = %s", (estado, prestamo_id))
+
+    # ---- Pagos préstamos ----
+    def obtener_pagos(self, prestamo_id=None):
+        if prestamo_id:
+            return self._query_df(
+                "SELECT * FROM pagos_prestamos WHERE prestamo_id = %s ORDER BY fecha_pago DESC",
+                (prestamo_id,)
             )
-            for item in items:
-                cur.execute("""
-                    INSERT INTO inspecciones_preop_items
-                    (inspeccion_id, seccion, item_numero, descripcion, resultado)
-                    VALUES (%s,%s,%s,%s,%s)
-                """, (
-                    inspeccion_id, item["seccion"], item["item_numero"],
-                    item["descripcion"], item["resultado"]
-                ))
-            c.commit()
-            cur.close()
-            return True
-        except Exception as e:
-            st.error(f"Error actualizando: {e}")
-            return False
-        finally:
-            self.release(c)
+        return self._query_df("SELECT * FROM pagos_prestamos ORDER BY fecha_pago DESC")
 
-    def eliminar_inspeccion(self, inspeccion_id: int) -> bool:
-        c = None
+    def registrar_pago(self, data):
+        conn = get_conn()
         try:
-            c = self.conn()
-            cur = c.cursor()
-            cur.execute("DELETE FROM inspecciones_preop WHERE id=%s", (inspeccion_id,))
-            c.commit()
-            cur.close()
-            return True
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO pagos_prestamos (prestamo_id, monto_pago, fecha_pago,
+                    observaciones, registrado_por, fecha_registro)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            """, (
+                data['prestamo_id'], int(data['monto_pago']),
+                data['fecha_pago'], data.get('observaciones','').strip(),
+                data.get('registrado_por','').strip().upper(), hora_colombia()
+            ))
+            nuevo_id = cur.fetchone()[0]
+            conn.commit()
+            return nuevo_id
         except Exception as e:
-            st.error(f"Error eliminando: {e}")
-            return False
+            conn.rollback()
+            st.error(f"Error registrando pago: {e}")
+            return None
         finally:
-            self.release(c)
+            put_conn(conn)
 
-    def obtener_inspecciones(self, fecha_ini=None, fecha_fin=None,
-                              maquina=None, estado=None, trabajador=None) -> pd.DataFrame:
-        c = None
+    def eliminar_pago(self, pago_id):
+        self._exec("DELETE FROM pagos_prestamos WHERE id = %s", (pago_id,))
+
+    # ---- Anticipos ----
+    def registrar_viaje(self, data):
+        conn = get_conn()
         try:
-            c = self.conn()
-            q = """
-                SELECT id, fecha, maquina, modelo, marca, placa,
-                       trabajador, revisado_por, cliente_proyecto,
-                       responsable_mantenimiento, estado, observaciones,
-                       fecha_registro
-                FROM inspecciones_preop WHERE 1=1
-            """
-            params = []
-            if fecha_ini:
-                q += " AND fecha >= %s"; params.append(fecha_ini)
-            if fecha_fin:
-                q += " AND fecha <= %s"; params.append(fecha_fin)
-            if maquina and maquina != "Todas":
-                q += " AND maquina = %s"; params.append(maquina)
-            if estado and estado != "Todos":
-                q += " AND estado ILIKE %s"; params.append(f"%{estado}%")
-            if trabajador:
-                q += " AND trabajador ILIKE %s"; params.append(f"%{trabajador}%")
-            q += " ORDER BY fecha DESC, id DESC"
-            return pd.read_sql(q, c, params=params)
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO anticipos_v1
+                (fecha_viaje, fecha_registro, placa, conductor, cliente,
+                 origen, destino, valor_anticipo, observaciones, manifiesto, legalizado)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE) RETURNING id
+            """, (
+                data['fecha_viaje'], hora_colombia(), data['placa'], data['conductor'],
+                data['cliente'], data['origen'], data['destino'],
+                int(data['valor_anticipo']), data.get('observaciones',''),
+                data.get('manifiesto','').strip().upper()
+            ))
+            nuevo_id = cur.fetchone()[0]
+            conn.commit()
+            return nuevo_id
         except Exception as e:
-            st.error(f"Error consultando inspecciones: {e}")
-            return pd.DataFrame()
+            conn.rollback()
+            st.error(f"Error guardando viaje: {e}")
+            return None
         finally:
-            self.release(c)
+            put_conn(conn)
 
-    def obtener_items_inspeccion(self, inspeccion_id: int) -> pd.DataFrame:
-        c = None
-        try:
-            c = self.conn()
-            return pd.read_sql("""
-                SELECT seccion, item_numero, descripcion, resultado
-                FROM inspecciones_preop_items
-                WHERE inspeccion_id = %s
-                ORDER BY seccion, item_numero
-            """, c, params=[inspeccion_id])
-        except Exception as e:
-            st.error(f"Error obteniendo ítems: {e}")
-            return pd.DataFrame()
-        finally:
-            self.release(c)
+    def editar_viaje(self, viaje_id, data):
+        return bool(self._exec("""
+            UPDATE anticipos_v1 SET
+                fecha_viaje = %s, placa = %s, conductor = %s, cliente = %s,
+                origen = %s, destino = %s, valor_anticipo = %s,
+                observaciones = %s, manifiesto = %s
+            WHERE id = %s
+        """, (
+            data['fecha_viaje'], data['placa'], data['conductor'], data['cliente'],
+            data['origen'], data['destino'], int(data['valor_anticipo']),
+            data.get('observaciones',''), data.get('manifiesto','').strip().upper(), viaje_id
+        )))
 
-    def obtener_todos_los_items(self, ids: list) -> pd.DataFrame:
-        """Una sola query para obtener items de múltiples inspecciones (para Excel)."""
-        if not ids:
-            return pd.DataFrame()
-        c = None
-        try:
-            c = self.conn()
-            return pd.read_sql("""
-                SELECT inspeccion_id, seccion, item_numero, descripcion, resultado
-                FROM inspecciones_preop_items
-                WHERE inspeccion_id = ANY(%s)
-                ORDER BY inspeccion_id, seccion, item_numero
-            """, c, params=[ids])
-        except Exception as e:
-            st.error(f"Error obteniendo todos los ítems: {e}")
-            return pd.DataFrame()
-        finally:
-            self.release(c)
+    def legalizar(self, viaje_id, nombre_quien_legaliza, obs_legalizacion=""):
+        return bool(self._exec("""
+            UPDATE anticipos_v1
+            SET legalizado = TRUE, fecha_legalizacion = %s,
+                legalizado_por = %s, obs_legalizacion = %s
+            WHERE id = %s
+        """, (hora_colombia(), nombre_quien_legaliza, obs_legalizacion, viaje_id)))
 
-    def stats_dashboard(self, fecha_ini, fecha_fin) -> pd.DataFrame:
-        c = None
-        try:
-            c = self.conn()
-            return pd.read_sql("""
-                SELECT i.id, i.fecha, i.maquina, i.trabajador, i.estado,
-                       COUNT(CASE WHEN it.resultado = 'NC' THEN 1 END) as num_nc,
-                       COUNT(CASE WHEN it.resultado = 'C'  THEN 1 END) as num_c,
-                       COUNT(it.id) as total_items
-                FROM inspecciones_preop i
-                LEFT JOIN inspecciones_preop_items it ON it.inspeccion_id = i.id
-                WHERE i.fecha >= %s AND i.fecha <= %s
-                GROUP BY i.id, i.fecha, i.maquina, i.trabajador, i.estado
-                ORDER BY i.fecha
-            """, c, params=[fecha_ini, fecha_fin])
-        except Exception as e:
-            st.error(f"Error en stats: {e}")
-            return pd.DataFrame()
-        finally:
-            self.release(c)
+    def buscar(self, estado=None, fecha_ini=None, fecha_fin=None, placa=None, conductor=None, manifiesto=None):
+        q = "SELECT * FROM anticipos_v1 WHERE 1=1"
+        params = []
+        if estado == "legalizado":   q += " AND legalizado = TRUE"
+        elif estado == "pendiente":  q += " AND legalizado = FALSE"
+        if fecha_ini: q += " AND fecha_viaje >= %s"; params.append(fecha_ini)
+        if fecha_fin: q += " AND fecha_viaje <= %s"; params.append(fecha_fin)
+        if placa:     q += " AND placa = %s";        params.append(placa)
+        if conductor: q += " AND conductor ILIKE %s"; params.append(f"%{conductor}%")
+        if manifiesto:q += " AND manifiesto ILIKE %s"; params.append(f"%{manifiesto}%")
+        q += " ORDER BY fecha_viaje DESC, fecha_registro DESC"
+        return self._query_df(q, params if params else None)
 
-    def verificar_inspeccion_existente(self, fecha, maquina) -> bool:
-        c = None
-        try:
-            c = self.conn()
-            cur = c.cursor()
-            cur.execute(
-                "SELECT COUNT(*) FROM inspecciones_preop WHERE fecha=%s AND maquina=%s",
-                (fecha, maquina)
-            )
-            count = cur.fetchone()[0]
-            cur.close()
-            return count > 0
-        except Exception:
-            return False
-        finally:
-            self.release(c)
+    def eliminar(self, viaje_id):
+        self._exec("DELETE FROM anticipos_v1 WHERE id = %s", (viaje_id,))
+
+    def obtener_por_id(self, viaje_id):
+        df = self._query_df("SELECT * FROM anticipos_v1 WHERE id = %s", (viaje_id,))
+        return df.iloc[0] if not df.empty else None
 
 
 # ==================== HELPERS ====================
-def construir_items(prefix: str) -> list:
-    items = []
-    for i, desc in enumerate(ITEMS_ANTES_USO):
-        key = f"{prefix}_au_{i}"
-        resultado = st.session_state.get(key, "C")
-        items.append({"seccion": "ANTES DE SU USO", "item_numero": i + 1,
-                       "descripcion": desc, "resultado": resultado})
-    for i, desc in enumerate(ITEMS_EPP):
-        key = f"{prefix}_epp_{i}"
-        resultado = st.session_state.get(key, "C")
-        items.append({"seccion": "ELEMENTOS DE PROTECCIÓN PERSONAL", "item_numero": i + 1,
-                       "descripcion": desc, "resultado": resultado})
-    for i, desc in enumerate(ITEMS_ELECTRICA):
-        key = f"{prefix}_elec_{i}"
-        resultado = st.session_state.get(key, "C")
-        items.append({"seccion": "SEGURIDAD ELÉCTRICA", "item_numero": i + 1,
-                       "descripcion": desc, "resultado": resultado})
-    return items
+def get_lista_clientes(db):
+    extras_df = db.obtener_clientes_extra()
+    extras = extras_df['nombre'].tolist() if not extras_df.empty else []
+    return sorted(set(CLIENTES_DEFAULT + extras))
+
+def get_lista_conductores(db):
+    extras_df = db.obtener_conductores_extra()
+    extras = extras_df['nombre'].tolist() if not extras_df.empty else []
+    return sorted(set(CONDUCTORES_DEFAULT + extras))
+
+def calcular_saldo_prestamo(prestamo_id, monto_total, df_pagos):
+    if df_pagos.empty:
+        return 0, int(monto_total)
+    pagos_p = df_pagos[df_pagos["prestamo_id"] == prestamo_id]
+    pagado = int(pagos_p["monto_pago"].sum())
+    saldo  = max(0, int(monto_total) - pagado)
+    return pagado, saldo
 
 
-def badge_resultado(val):
-    if val == "C":   return "🟢 C"
-    if val == "NC":  return "🔴 NC"
-    return "⚪ N/A"
+# ==================== WIDGET PAGO VACACIONES (reutilizable) ====================
+def widget_pago_vacacion(db, cond, anio_num, p, dias_pend_p, pagado_en_dinero,
+                          monto_pago_din, fecha_pago_din, reg_por_din, pago_vac_id):
+    clave_form = (cond, anio_num)
+    label_boton = "✏️ Editar pago en dinero" if pagado_en_dinero else "💵 Registrar pago en dinero"
+
+    if st.session_state.pago_vac_periodo != clave_form:
+        col_btn1, col_btn2 = st.columns([2, 2])
+        with col_btn1:
+            if st.button(label_boton, key=f"btn_pago_vac_{cond}_{anio_num}", type="primary"):
+                st.session_state.pago_vac_periodo = clave_form
+                st.rerun()
+        if pagado_en_dinero and pago_vac_id:
+            with col_btn2:
+                if st.session_state.confirmar_eliminar_pago_vac == pago_vac_id:
+                    st.warning(f"¿Eliminar el pago de **{p['label']}**?")
+                    col_si_pv, col_no_pv, _ = st.columns([1, 1, 4])
+                    with col_si_pv:
+                        if st.button("✅ Sí", key=f"si_pvac_{pago_vac_id}", type="primary"):
+                            db.eliminar_pago_vacacion(pago_vac_id)
+                            st.session_state.confirmar_eliminar_pago_vac = None
+                            st.rerun()
+                    with col_no_pv:
+                        if st.button("❌ No", key=f"no_pvac_{pago_vac_id}"):
+                            st.session_state.confirmar_eliminar_pago_vac = None
+                            st.rerun()
+                else:
+                    if st.button("🗑️ Eliminar pago", key=f"del_pvac_{cond}_{anio_num}",
+                                  help="Eliminar pago registrado (revertir a pendiente)"):
+                        st.session_state.confirmar_eliminar_pago_vac = pago_vac_id
+                        st.rerun()
+
+    if st.session_state.pago_vac_periodo == clave_form:
+        titulo_form = f"**{'✏️ Editar' if pagado_en_dinero else '💵 Registrar'} pago en dinero — {p['label']}**"
+        with st.form(f"form_pago_vac_{cond}_{anio_num}"):
+            st.markdown(titulo_form)
+            if dias_pend_p > 0:
+                st.caption(f"Días pendientes a compensar: **{dias_pend_p}**")
+            col_pv1, col_pv2 = st.columns(2)
+            with col_pv1:
+                valor_inicial_monto = fmt(monto_pago_din) if pagado_en_dinero and monto_pago_din > 0 else ""
+                monto_pv_txt = st.text_input(
+                    "Monto pagado (COP)",
+                    value=valor_inicial_monto,
+                    placeholder="Ej: 750.000",
+                    key=f"monto_pv_{cond}_{anio_num}"
+                )
+                monto_pv = limpiar(monto_pv_txt)
+                if monto_pv > 0:
+                    st.caption(f"💵 {fmt(monto_pv)} COP")
+                fecha_default_pv = datetime.today()
+                if pagado_en_dinero and fecha_pago_din and fecha_pago_din != "—":
+                    try:
+                        fecha_default_pv = datetime.strptime(fecha_pago_din, '%d/%m/%Y')
+                    except:
+                        fecha_default_pv = datetime.today()
+                fecha_pv = st.date_input(
+                    "Fecha del pago",
+                    value=fecha_default_pv,
+                    key=f"fecha_pv_{cond}_{anio_num}"
+                )
+            with col_pv2:
+                reg_por_pv = st.text_input(
+                    "Registrado por",
+                    value=reg_por_din if pagado_en_dinero else "",
+                    placeholder="Tu nombre completo",
+                    key=f"reg_pv_{cond}_{anio_num}"
+                )
+                obs_pv = st.text_area(
+                    "Observaciones",
+                    height=68,
+                    key=f"obs_pv_{cond}_{anio_num}"
+                )
+
+            col_gp, col_cp = st.columns(2)
+            with col_gp:
+                guardar_pv = st.form_submit_button("💾 Guardar pago", type="primary")
+            with col_cp:
+                cancelar_pv = st.form_submit_button("✖ Cancelar")
+
+            if guardar_pv:
+                errores_pv = []
+                if monto_pv <= 0:
+                    errores_pv.append("El monto debe ser mayor a 0.")
+                if not reg_por_pv.strip():
+                    errores_pv.append("Ingresa tu nombre.")
+                if errores_pv:
+                    for ep in errores_pv:
+                        st.error(f"⚠️ {ep}")
+                else:
+                    nid_pv = db.registrar_pago_vacacion({
+                        'conductor': cond,
+                        'anio_laboral': anio_num,
+                        'periodo_label': p['label'],
+                        'monto_cop': monto_pv,
+                        'fecha_pago': fecha_pv,
+                        'observaciones': obs_pv.strip(),
+                        'registrado_por': reg_por_pv.strip(),
+                    })
+                    if nid_pv:
+                        accion = "actualizado" if pagado_en_dinero else "registrado"
+                        st.success(
+                            f"✅ Pago {accion} para **{cond}** — "
+                            f"{p['label']} — ${fmt(monto_pv)} COP"
+                        )
+                        st.session_state.pago_vac_periodo = None
+                        st.rerun()
+            if cancelar_pv:
+                st.session_state.pago_vac_periodo = None
+                st.rerun()
 
 
-def render_items_seccion(seccion_label: str, items_lista: list, prefix: str, sufijo: str,
-                          valores_previos: dict = None):
-    st.markdown(f"<div class='seccion-titulo'>📋 {seccion_label}</div>", unsafe_allow_html=True)
-    for i, desc in enumerate(items_lista):
-        key  = f"{prefix}_{sufijo}_{i}"
-        prev = valores_previos.get(key, "C") if valores_previos else "C"
-        cols = st.columns([0.85, 0.15])
-        with cols[0]:
-            st.markdown(f"<div class='item-label'>{i+1}. {desc}</div>", unsafe_allow_html=True)
-        with cols[1]:
-            st.selectbox(
-                "Resultado", OPCIONES_INSPECCION,
-                index=OPCIONES_INSPECCION.index(prev) if prev in OPCIONES_INSPECCION else 0,
-                key=key, label_visibility="collapsed"
-            )
-
-
-# ==================== EXCEL ====================
-def generar_excel(df_inspecciones: pd.DataFrame, db: "DB", titulo: str = "Inspecciones Preoperacionales") -> bytes:
-    wb = Workbook()
-
-    ft_titulo = Font(name="Calibri", bold=True, size=14, color="FFFFFF")
-    ft_header = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
-    ft_normal = Font(name="Calibri", size=9)
-    ft_total  = Font(name="Calibri", bold=True, size=10)
-    ft_nc     = Font(name="Calibri", size=9, color="C0392B", bold=True)
-    ft_apro   = Font(name="Calibri", size=9, color="1E8449")
-
-    fill_titulo  = PatternFill("solid", start_color="0F2027")
-    fill_header  = PatternFill("solid", start_color="203A43")
-    fill_alt     = PatternFill("solid", start_color="EBF5FB")
-    fill_total   = PatternFill("solid", start_color="D5DBDB")
-    fill_nc_row  = PatternFill("solid", start_color="FADBD8")
-    fill_obs_row = PatternFill("solid", start_color="FDEBD0")
-
-    borde  = Border(left=Side(style="thin"), right=Side(style="thin"),
-                    top=Side(style="thin"),  bottom=Side(style="thin"))
-    centro = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    izq    = Alignment(horizontal="left",   vertical="center", wrap_text=True)
-
-    now_col = datetime.now(pytz.timezone("America/Bogota"))
-
-    # ── Una sola query para TODOS los items (eficiente) ──────────────────────
-    ids_list = df_inspecciones["id"].astype(int).tolist()
-    df_all_items = db.obtener_todos_los_items(ids_list)
-    items_por_id = {}
-    if not df_all_items.empty:
-        for insp_id, grp in df_all_items.groupby("inspeccion_id"):
-            items_por_id[int(insp_id)] = grp
-
-    # =========================================================================
-    # HOJA 1 – RESUMEN INSPECCIONES
-    # =========================================================================
-    ws = wb.active
-    ws.title = "Inspecciones"
-    total_cols = 14
-
-    ws.merge_cells(f"A1:{get_column_letter(total_cols)}1")
-    ws["A1"] = f"🔧 {titulo}   |   Generado: {now_col.strftime('%d/%m/%Y %H:%M')} (COL)   |   Total: {len(df_inspecciones)} inspecciones"
-    ws["A1"].font      = ft_titulo
-    ws["A1"].fill      = fill_titulo
-    ws["A1"].alignment = centro
-    ws.row_dimensions[1].height = 30
-
-    columnas = [
-        ("id",                        "ID",            6),
-        ("fecha",                     "FECHA",         12),
-        ("maquina",                   "MÁQUINA",       20),
-        ("modelo",                    "MODELO",        14),
-        ("marca",                     "MARCA",         14),
-        ("placa",                     "PLACA",         12),
-        ("trabajador",                "TRABAJADOR",    24),
-        ("revisado_por",              "REVISADO POR",  24),
-        ("cliente_proyecto",          "CLIENTE/PROY.", 20),
-        ("responsable_mantenimiento", "RESP. MANT.",   24),
-        ("estado",                    "ESTADO",        18),
-        ("num_nc",                    "# NC",           7),
-        ("num_c",                     "# C",            7),
-        ("observaciones",             "OBSERVACIONES", 32),
-    ]
-
-    for idx, (key, nombre, ancho) in enumerate(columnas, start=1):
-        cell = ws.cell(row=2, column=idx, value=nombre)
-        cell.font = ft_header; cell.fill = fill_header
-        cell.alignment = centro; cell.border = borde
-        ws.column_dimensions[get_column_letter(idx)].width = ancho
-    ws.row_dimensions[2].height = 28
-
-    for row_idx, (_, fila) in enumerate(df_inspecciones.iterrows(), start=3):
-        insp_id  = int(fila["id"])
-        df_it    = items_por_id.get(insp_id, pd.DataFrame())
-        num_nc   = len(df_it[df_it["resultado"] == "NC"]) if not df_it.empty else 0
-        num_c    = len(df_it[df_it["resultado"] == "C"])  if not df_it.empty else 0
-        estado_val = str(fila.get("estado", ""))
-        es_rech  = "Rechazada"      in estado_val
-        es_obs   = "Observaciones"  in estado_val
-        fill_f   = fill_nc_row if es_rech else (fill_obs_row if es_obs else (fill_alt if row_idx % 2 == 0 else None))
-
-        valores = {
-            "id": insp_id, "fecha": str(fila.get("fecha","")),
-            "maquina": fila.get("maquina",""), "modelo": fila.get("modelo",""),
-            "marca": fila.get("marca",""), "placa": fila.get("placa",""),
-            "trabajador": fila.get("trabajador",""), "revisado_por": fila.get("revisado_por",""),
-            "cliente_proyecto": fila.get("cliente_proyecto",""),
-            "responsable_mantenimiento": fila.get("responsable_mantenimiento",""),
-            "estado": estado_val, "num_nc": num_nc, "num_c": num_c,
-            "observaciones": fila.get("observaciones",""),
-        }
-
-        for col_idx, (key, _, _) in enumerate(columnas, start=1):
-            val  = valores.get(key, "")
-            cell = ws.cell(row=row_idx, column=col_idx, value=str(val) if val != "" else "")
-            cell.border = borde
-            cell.alignment = centro if key in ("id","fecha","estado","num_nc","num_c","placa") else izq
-            if key == "num_nc" and num_nc > 0:
-                cell.font = ft_nc
-            elif key == "estado" and "Aprobada" in str(val):
-                cell.font = ft_apro
-            else:
-                cell.font = ft_normal
-            if fill_f:
-                cell.fill = fill_f
-        ws.row_dimensions[row_idx].height = 18
-
-    aprobadas = len(df_inspecciones[df_inspecciones["estado"].str.contains("Aprobada",      na=False)])
-    obs_count = len(df_inspecciones[df_inspecciones["estado"].str.contains("Observaciones", na=False)])
-    rech      = len(df_inspecciones[df_inspecciones["estado"].str.contains("Rechazada",     na=False)])
-    total_row = len(df_inspecciones) + 3
-    try:
-        ws.merge_cells(f"A{total_row}:{get_column_letter(total_cols)}{total_row}")
-    except Exception:
-        pass
-    ct = ws.cell(row=total_row, column=1,
-                 value=f"TOTAL: {len(df_inspecciones)}   |   ✅ Aprobadas: {aprobadas}   ⚠️ Con Obs: {obs_count}   ❌ Rechazadas: {rech}")
-    ct.font = ft_total; ct.fill = fill_total; ct.alignment = centro
-    ws.freeze_panes = "A3"
-
-    # =========================================================================
-    # HOJA 2 – DETALLE ÍTEMS
-    # =========================================================================
-    ws2 = wb.create_sheet("Detalle Ítems")
-    ws2.merge_cells("A1:G1")
-    ws2["A1"] = "Detalle de Ítems por Inspección"
-    ws2["A1"].font = ft_titulo; ws2["A1"].fill = fill_titulo; ws2["A1"].alignment = centro
-    ws2.row_dimensions[1].height = 26
-
-    hdrs2   = ["ID INSP.", "FECHA", "MÁQUINA", "SECCIÓN", "N°", "DESCRIPCIÓN DEL ÍTEM", "RESULTADO"]
-    anchos2 = [8, 12, 20, 30, 5, 70, 10]
-    for ci, (h, w) in enumerate(zip(hdrs2, anchos2), start=1):
-        c = ws2.cell(2, ci, h)
-        c.font = ft_header; c.fill = fill_header; c.alignment = centro; c.border = borde
-        ws2.column_dimensions[get_column_letter(ci)].width = w
-    ws2.row_dimensions[2].height = 24
-
-    fila2 = 3
-    for _, insp in df_inspecciones.iterrows():
-        insp_id = int(insp["id"])
-        df_it   = items_por_id.get(insp_id, pd.DataFrame())
-        if df_it.empty:
-            continue
-        for _, item in df_it.iterrows():
-            res = str(item.get("resultado", "C"))
-            fill_item = PatternFill("solid", start_color="FADBD8") if res == "NC" else (
-                        PatternFill("solid", start_color="EBF5FB") if fila2 % 2 == 0 else None)
-            vals = [insp_id, str(insp.get("fecha","")), str(insp.get("maquina","")),
-                    str(item.get("seccion","")), int(item.get("item_numero",0)),
-                    str(item.get("descripcion","")), res]
-            for ci, v in enumerate(vals, start=1):
-                c = ws2.cell(fila2, ci, v)
-                c.font = ft_nc if res == "NC" else ft_normal
-                c.border = borde
-                c.alignment = izq if ci == 6 else centro
-                if fill_item:
-                    c.fill = fill_item
-            ws2.row_dimensions[fila2].height = 18
-            fila2 += 1
-    ws2.freeze_panes = "A3"
-
-    # =========================================================================
-    # HOJA 3 – RESUMEN POR MÁQUINA
-    # =========================================================================
-    ws3 = wb.create_sheet("Por Máquina")
-    ws3.merge_cells("A1:H1")
-    ws3["A1"] = "Resumen de Inspecciones por Máquina"
-    ws3["A1"].font = ft_titulo; ws3["A1"].fill = fill_titulo; ws3["A1"].alignment = centro
-    ws3.row_dimensions[1].height = 26
-
-    hdrs3   = ["MÁQUINA","TOTAL INSP.","✅ APROBADAS","⚠️ CON OBS.","❌ RECHAZADAS","% APROBACIÓN","ÚLTIMO INSPECTOR","ÚLTIMA FECHA"]
-    anchos3 = [22, 12, 14, 14, 14, 14, 28, 14]
-    for ci, (h, w) in enumerate(zip(hdrs3, anchos3), start=1):
-        c = ws3.cell(2, ci, h)
-        c.font = ft_header; c.fill = fill_header; c.alignment = centro; c.border = borde
-        ws3.column_dimensions[get_column_letter(ci)].width = w
-    ws3.row_dimensions[2].height = 24
-
-    if not df_inspecciones.empty and "maquina" in df_inspecciones.columns:
-        resumen_maq = df_inspecciones.groupby("maquina").apply(lambda g: pd.Series({
-            "total":       len(g),
-            "aprobadas":   g["estado"].str.contains("Aprobada",      na=False).sum(),
-            "con_obs":     g["estado"].str.contains("Observaciones",  na=False).sum(),
-            "rechazadas":  g["estado"].str.contains("Rechazada",      na=False).sum(),
-            "ultimo_insp": g.sort_values("fecha").iloc[-1]["trabajador"] if len(g) > 0 else "",
-            "ultima_fecha":str(g["fecha"].max()),
-        })).reset_index().sort_values("total", ascending=False)
-
-        for i, row in enumerate(resumen_maq.itertuples(), start=3):
-            pct    = f"{round(row.aprobadas / row.total * 100, 1)}%" if row.total > 0 else "0%"
-            fill_r = PatternFill("solid", start_color="EBF5FB") if i % 2 == 0 else None
-            vals   = [row.maquina, int(row.total), int(row.aprobadas),
-                      int(row.con_obs), int(row.rechazadas), pct,
-                      str(row.ultimo_insp), str(row.ultima_fecha)]
-            for ci, v in enumerate(vals, start=1):
-                c = ws3.cell(i, ci, v)
-                c.font = ft_normal; c.border = borde
-                c.alignment = izq if ci in (1, 7) else centro
-                if fill_r: c.fill = fill_r
-            ws3.row_dimensions[i].height = 18
-    ws3.freeze_panes = "A3"
-
-    # =========================================================================
-    # HOJA 4 – RANKING NC
-    # =========================================================================
-    ws4 = wb.create_sheet("Ranking NC")
-    ws4.merge_cells("A1:D1")
-    ws4["A1"] = "Ranking de No Conformidades por Ítem"
-    ws4["A1"].font = ft_titulo; ws4["A1"].fill = fill_titulo; ws4["A1"].alignment = centro
-    ws4.row_dimensions[1].height = 26
-
-    hdrs4   = ["SECCIÓN", "DESCRIPCIÓN DEL ÍTEM", "# NC", "% NC"]
-    anchos4 = [30, 75, 8, 10]
-    for ci, (h, w) in enumerate(zip(hdrs4, anchos4), start=1):
-        c = ws4.cell(2, ci, h)
-        c.font = ft_header; c.fill = PatternFill("solid", start_color="922B21")
-        c.alignment = centro; c.border = borde
-        ws4.column_dimensions[get_column_letter(ci)].width = w
-    ws4.row_dimensions[2].height = 24
-
-    if not df_all_items.empty:
-        total_insp = len(df_inspecciones)
-        ranking_nc = df_all_items.groupby(["seccion","descripcion"]).apply(
-            lambda g: pd.Series({"num_nc": (g["resultado"] == "NC").sum()})
-        ).reset_index().sort_values("num_nc", ascending=False)
-
-        for i, row in enumerate(ranking_nc.itertuples(), start=3):
-            pct    = f"{round(row.num_nc / total_insp * 100, 1)}%" if total_insp > 0 else "0%"
-            fill_r4 = PatternFill("solid", start_color="FADBD8") if row.num_nc > 0 and i % 2 == 0 else (
-                      PatternFill("solid", start_color="EBF5FB") if i % 2 == 0 else None)
-            vals = [row.seccion, row.descripcion, int(row.num_nc), pct]
-            for ci, v in enumerate(vals, start=1):
-                c = ws4.cell(i, ci, v)
-                c.font = ft_nc if row.num_nc > 0 and ci == 3 else ft_normal
-                c.border = borde
-                c.alignment = izq if ci == 2 else centro
-                if fill_r4: c.fill = fill_r4
-            ws4.row_dimensions[i].height = 18
-    ws4.freeze_panes = "A3"
-
-    # =========================================================================
-    # HOJA 5 – POR INSPECTOR
-    # =========================================================================
-    ws5 = wb.create_sheet("Por Inspector")
-    ws5.merge_cells("A1:F1")
-    ws5["A1"] = "Resumen por Inspector / Trabajador"
-    ws5["A1"].font = ft_titulo; ws5["A1"].fill = fill_titulo; ws5["A1"].alignment = centro
-    ws5.row_dimensions[1].height = 26
-
-    hdrs5   = ["TRABAJADOR","TOTAL INSP.","✅ APROBADAS","⚠️ CON OBS.","❌ RECHAZADAS","% APROBACIÓN"]
-    anchos5 = [30, 12, 14, 14, 14, 14]
-    for ci, (h, w) in enumerate(zip(hdrs5, anchos5), start=1):
-        c = ws5.cell(2, ci, h)
-        c.font = ft_header; c.fill = PatternFill("solid", start_color="1A5276")
-        c.alignment = centro; c.border = borde
-        ws5.column_dimensions[get_column_letter(ci)].width = w
-    ws5.row_dimensions[2].height = 24
-
-    if not df_inspecciones.empty and "trabajador" in df_inspecciones.columns:
-        resumen_insp = df_inspecciones[
-            df_inspecciones["trabajador"].notna() & (df_inspecciones["trabajador"].str.strip() != "")
-        ].groupby("trabajador").apply(lambda g: pd.Series({
-            "total":      len(g),
-            "aprobadas":  g["estado"].str.contains("Aprobada",      na=False).sum(),
-            "con_obs":    g["estado"].str.contains("Observaciones",  na=False).sum(),
-            "rechazadas": g["estado"].str.contains("Rechazada",     na=False).sum(),
-        })).reset_index().sort_values("total", ascending=False)
-
-        for i, row in enumerate(resumen_insp.itertuples(), start=3):
-            pct    = f"{round(row.aprobadas / row.total * 100, 1)}%" if row.total > 0 else "0%"
-            fill_r = PatternFill("solid", start_color="EBF5FB") if i % 2 == 0 else None
-            vals   = [row.trabajador, int(row.total), int(row.aprobadas),
-                      int(row.con_obs), int(row.rechazadas), pct]
-            for ci, v in enumerate(vals, start=1):
-                c = ws5.cell(i, ci, v)
-                c.font = ft_normal; c.border = borde
-                c.alignment = izq if ci == 1 else centro
-                if fill_r: c.fill = fill_r
-            ws5.row_dimensions[i].height = 18
-    ws5.freeze_panes = "A3"
-
-    # =========================================================================
-    # HOJA 6 – GRÁFICAS
-    # =========================================================================
-    try:
-        from openpyxl.chart import PieChart, Reference
-        from openpyxl.chart.series import DataPoint
-
-        ws6 = wb.create_sheet("Gráficas")
-        ws6["A1"] = "Estado"; ws6["B1"] = "Cantidad"
-        ws6["A1"].font = ft_header; ws6["B1"].font = ft_header
-        ws6["A1"].fill = fill_header; ws6["B1"].fill = fill_header
-
-        estados_g = ["Aprobada", "Con Observaciones", "Rechazada"]
-        for i, est in enumerate(estados_g, start=2):
-            cnt = len(df_inspecciones[df_inspecciones["estado"].str.contains(est, na=False)]) \
-                  if "estado" in df_inspecciones.columns else 0
-            ws6.cell(i, 1, est).border = borde
-            ws6.cell(i, 2, cnt).border  = borde
-
-        pie = PieChart()
-        pie.title  = "Distribución por Estado"
-        pie.style  = 10
-        labels     = Reference(ws6, min_col=1, min_row=2, max_row=4)
-        data       = Reference(ws6, min_col=2, min_row=1, max_row=4)
-        pie.add_data(data, titles_from_data=True)
-        pie.set_categories(labels)
-        pie.width  = 15; pie.height = 12
-        colores_g  = ["2ECC71", "F39C12", "E74C3C"]
-        for idx, color in enumerate(colores_g):
-            pt = DataPoint(idx=idx)
-            pt.graphicalProperties.solidFill = color
-            pie.series[0].dPt.append(pt)
-        ws6.add_chart(pie, "D1")
-        for col_l, w in zip(["A","B"], [22, 10]):
-            ws6.column_dimensions[col_l].width = w
-    except Exception:
-        pass
-
-    output = io.BytesIO()
-    wb.save(output)
-    return output.getvalue()
-
-
-# ==================== MAIN ====================
+# ==================== APP PRINCIPAL ====================
 def main():
-    st.markdown("""
-    <div class="main-header">
-        <h1>🔧 INSPECCIONES PREOPERACIONALES</h1>
-        <p>Registro y seguimiento de inspecciones de equipos — SCA ZF</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.set_page_config(page_title="Anticipos - Transporte de Carga", layout="wide", page_icon="🚛")
+    st.title("🚛 Gestión de Anticipos - Transporte de Carga")
 
-    if "db" not in st.session_state:
-        st.session_state.db = DB()
-    if "editando_id" not in st.session_state:
-        st.session_state.editando_id = None
+    session_defaults = {
+        'db': None, 'confirmar_eliminar': None, 'editando_id': None,
+        'confirmar_eliminar_cliente': None, 'confirmar_eliminar_conductor': None,
+        'editando_conductor_id': None, 'confirmar_eliminar_vac': None,
+        'editando_vac_id': None,
+        'confirmar_eliminar_prestamo': None, 'confirmar_eliminar_pago': None,
+        'pago_vac_periodo': None,
+        'confirmar_eliminar_pago_vac': None,
+        'editando_fecha_ingreso_conductor': None,
+    }
+    for key, val in session_defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 
+    if st.session_state.db is None:
+        db = DB()
+        db.init_tablas()
+        st.session_state.db = db
     db = st.session_state.db
 
-    tab1, tab2, tab3 = st.tabs(["📝 Nueva Inspección", "🔍 Historial y Reportes", "📊 Dashboard"])
+    (tab_reg, tab_leg, tab_hist,
+     tab_vac, tab_prest,
+     tab_clientes, tab_conductores) = st.tabs([
+        "📝 Registrar Viaje",
+        "✅ Legalizar Anticipos",
+        "📋 Historial",
+        "🏖️ Vacaciones",
+        "💰 Préstamos",
+        "🏢 Clientes",
+        "👤 Conductores",
+    ])
 
-    # =========================================================================
-    # TAB 1 – NUEVA INSPECCIÓN
-    # =========================================================================
-    with tab1:
-        st.markdown("### Registrar Nueva Inspección Preoperacional")
+    # ==================== TAB 1: REGISTRAR ====================
+    with tab_reg:
+        st.header("Registrar nuevo viaje con anticipo")
+        lista_clientes    = get_lista_clientes(db)
+        lista_conductores = get_lista_conductores(db)
 
-        st.markdown("<div class='seccion-titulo'>🏭 1. DATOS DEL EQUIPO</div>", unsafe_allow_html=True)
-        d1, d2, d3, d4, d5 = st.columns(5)
-        with d1: fecha_insp   = st.date_input("📅 Fecha", datetime.now(), key="n_fecha")
-        with d2: maquina_sel  = st.selectbox("⚙️ Máquina", MAQUINAS, key="n_maquina")
-        with d3: modelo_inp   = st.text_input("Modelo",      placeholder="Ej: ZF-200X", key="n_modelo")
-        with d4: marca_inp    = st.text_input("Marca",       placeholder="Ej: SCA",     key="n_marca")
-        with d5: placa_inp    = st.text_input("Placa / Serie", placeholder="Ej: MQ-001", key="n_placa")
+        with st.form("form_registro", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                fecha_viaje = st.date_input("Fecha del viaje", value=datetime.today())
+                placa       = st.selectbox("Placa de la tractomula", PLACAS)
+                conductor   = st.selectbox("Conductor", lista_conductores)
+                cliente     = st.selectbox("Cliente", lista_clientes)
+            with col2:
+                manifiesto  = st.text_input("Número de manifiesto ✱", placeholder="Ej: 1234567")
+                origen      = st.text_input("Origen",  placeholder="Ciudad de origen")
+                destino     = st.text_input("Destino", placeholder="Ciudad de destino")
+                anticipo_txt = st.text_input("Valor del anticipo (COP)", placeholder="Ejemplo: 1.500.000")
+                anticipo = limpiar(anticipo_txt)
+                if anticipo > 0:
+                    st.caption(f"💵 {fmt(anticipo)} COP")
+                observaciones = st.text_area("Observaciones", height=80)
 
-        if db.verificar_inspeccion_existente(fecha_insp, maquina_sel):
-            st.warning(f"⚠️ Ya existe una inspección para **{maquina_sel}** el **{fecha_insp}**. Si continúas, se registrará una segunda.")
+            submitted = st.form_submit_button("💾 Registrar Viaje", type="primary")
+            if submitted:
+                errores = []
+                if not manifiesto.strip(): errores.append("El número de manifiesto es obligatorio")
+                if not origen.strip():     errores.append("Origen es obligatorio")
+                if not destino.strip():    errores.append("Destino es obligatorio")
+                if anticipo <= 0:          errores.append("El valor del anticipo debe ser mayor a 0")
+                if errores:
+                    for e in errores: st.error(f"⚠️ {e}")
+                else:
+                    nuevo_id = db.registrar_viaje({
+                        'fecha_viaje': fecha_viaje, 'placa': placa,
+                        'conductor': conductor.strip().upper(),
+                        'cliente': cliente.strip().upper(),
+                        'origen': origen.strip().upper(),
+                        'destino': destino.strip().upper(),
+                        'valor_anticipo': anticipo,
+                        'observaciones': observaciones.strip(),
+                        'manifiesto': manifiesto.strip()
+                    })
+                    if nuevo_id:
+                        st.success(f"✅ Viaje registrado exitosamente (ID: {nuevo_id})")
 
-        st.markdown("<div class='seccion-titulo'>🔍 2. LISTA DE ACTIVIDADES — ANTES DE SU USO</div>",
-                    unsafe_allow_html=True)
-        st.caption("Selecciona **C** = Cumple · **NC** = No Cumple · **N/A** = No Aplica")
-        render_items_seccion("ANTES DE SU USO",                    ITEMS_ANTES_USO, "new", "au")
-        render_items_seccion("🦺 3A. ELEMENTOS DE PROTECCIÓN PERSONAL", ITEMS_EPP, "new", "epp")
-        render_items_seccion("⚡ 3B. SEGURIDAD ELÉCTRICA",      ITEMS_ELECTRICA,   "new", "elec")
+    # ==================== TAB 2: LEGALIZAR ====================
+    with tab_leg:
+        st.header("Legalizar anticipos pendientes")
+        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+        with col_f1: fecha_ini_leg = st.date_input("Desde", value=None, key="leg_fi")
+        with col_f2: fecha_fin_leg = st.date_input("Hasta", value=None, key="leg_ff")
+        with col_f3: placa_leg = st.selectbox("Placa", ["Todas"] + PLACAS, key="leg_placa")
+        with col_f4: manifiesto_leg = st.text_input("Buscar por manifiesto", placeholder="Nº manifiesto...", key="leg_manif")
 
-        st.markdown("<div class='seccion-titulo'>📋 4. DATOS DE CONTROL</div>", unsafe_allow_html=True)
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: trabajador_inp = st.text_input("👷 Trabajador",          placeholder="Nombre del operario",    key="n_trab")
-        with c2: revisado_inp   = st.text_input("👤 Revisado por",        placeholder="Supervisor / Jefe",      key="n_rev")
-        with c3: cliente_inp    = st.text_input("🏢 Cliente / Proyecto",  placeholder="Nombre del proyecto",    key="n_cli")
-        with c4: resp_mant_inp  = st.text_input("🔧 Resp. Mantenimiento", placeholder="Nombre del responsable", key="n_mant")
+        fi = fecha_ini_leg.strftime('%Y-%m-%d') if fecha_ini_leg else None
+        ff = fecha_fin_leg.strftime('%Y-%m-%d') if fecha_fin_leg else None
+        pl = None if placa_leg == "Todas" else placa_leg
+        mf = manifiesto_leg.strip() if manifiesto_leg else None
+        df_pendientes = db.buscar(estado="pendiente", fecha_ini=fi, fecha_fin=ff, placa=pl, manifiesto=mf)
 
-        e1, e2 = st.columns([1, 3])
-        with e1: estado_inp = st.selectbox("🚦 Estado", ESTADOS_INSPECCION, key="n_estado")
-        with e2: obs_inp    = st.text_area("💬 Comentarios / Observaciones",
-                                            placeholder="Describa cualquier anomalía. REPORTAR INMEDIATAMENTE al encargado de equipos y al departamento de mantenimiento.",
-                                            height=90, key="n_obs")
+        if df_pendientes.empty:
+            st.success("✅ No hay anticipos pendientes de legalización.")
+        else:
+            criticos, atencion, al_dia = [], [], []
+            for _, row in df_pendientes.iterrows():
+                dias, nivel = clasificar_alerta(row['fecha_viaje'])
+                entry = (row['id'], dias)
+                if nivel == "critical": criticos.append(entry)
+                elif nivel == "warning": atencion.append(entry)
+                else: al_dia.append(entry)
+            total_pendiente = df_pendientes['valor_anticipo'].sum()
+            if criticos:
+                st.error(f"🚨 **{len(criticos)} anticipo(s) CRÍTICO(S)** | 🟡 {len(atencion)} en atención | 🟢 {len(al_dia)} al día | 💰 Total: **${fmt(total_pendiente)} COP**")
+            elif atencion:
+                st.warning(f"🟡 **{len(atencion)} anticipo(s)** requieren atención | 🟢 {len(al_dia)} al día | 💰 Total: **${fmt(total_pendiente)} COP**")
+            else:
+                st.info(f"🟢 {len(al_dia)} viaje(s) pendiente(s), todos al día | 💰 Total: **${fmt(total_pendiente)} COP**")
+
+            df_ordenado = df_pendientes.sort_values("fecha_viaje", ascending=False)
+            for _, row in df_ordenado.iterrows():
+                dias, nivel = clasificar_alerta(row['fecha_viaje'])
+                badge = badge_alerta(dias, nivel)
+                manif_label = f"Manif: {row.get('manifiesto','—')} | " if row.get('manifiesto') else ""
+                label_expander = (f"{badge} | ID {row['id']} | {manif_label}"
+                    f"{fmt_fecha(row['fecha_viaje'])} | {row['placa']} | {row['conductor']} | "
+                    f"{row['origen']} → {row['destino']} | ${fmt(row['valor_anticipo'])} COP")
+                with st.expander(label_expander):
+                    col_info, col_form = st.columns([2, 2])
+                    with col_info:
+                        st.markdown("**Datos del viaje:**")
+                        if nivel == "critical": st.error(f"⏰ Este anticipo lleva **{dias} días** sin legalizar")
+                        elif nivel == "warning": st.warning(f"⚠️ Este anticipo lleva **{dias} días** sin legalizar")
+                        else: st.success(f"✅ {dias} días desde el viaje — al día")
+                        st.write(f"📄 Manifiesto: **{row.get('manifiesto', '—')}**")
+                        st.write(f"📅 Fecha: {fmt_fecha(row['fecha_viaje'])} | 🚛 {row['placa']} | 👤 {row['conductor']}")
+                        st.write(f"🏢 {row['cliente']} | 📍 {row['origen']} → {row['destino']}")
+                        st.write(f"💰 **${fmt(row['valor_anticipo'])} COP**")
+                        # ── NUEVO v17: observaciones del viaje en legalizar ──
+                        if row.get('observaciones'):
+                            st.info(f"📝 Observaciones: {row['observaciones']}")
+                    with col_form:
+                        st.markdown("**Legalizar este viaje:**")
+                        nombre_leg = st.text_input("Tu nombre completo", key=f"nombre_leg_{row['id']}")
+                        obs_leg = st.text_area("Observaciones", height=80, key=f"obs_leg_{row['id']}")
+                        if st.button("✅ Marcar como LEGALIZADO", key=f"btn_leg_{row['id']}", type="primary"):
+                            if not nombre_leg.strip():
+                                st.error("⚠️ Debes escribir tu nombre.")
+                            else:
+                                ok = db.legalizar(row['id'], nombre_leg.strip().upper(), obs_leg.strip())
+                                if ok:
+                                    st.success(f"✅ Viaje ID {row['id']} legalizado."); st.rerun()
+
+    # ==================== TAB 3: HISTORIAL ====================
+    with tab_hist:
+        st.header("Historial de viajes")
+        col1, col2, col3 = st.columns(3)
+        with col1: estado_filtro = st.selectbox("Estado", ["Todos","Pendientes","Legalizados"], key="hist_estado")
+        with col2: fecha_ini_h  = st.date_input("Desde", value=None, key="hist_fi")
+        with col3: fecha_fin_h  = st.date_input("Hasta", value=None, key="hist_ff")
+        col4, col5, col6 = st.columns(3)
+        with col4: placa_h      = st.selectbox("Placa", ["Todas"] + PLACAS, key="hist_placa")
+        with col5: conductor_h  = st.text_input("Buscar conductor", key="hist_cond")
+        with col6: manifiesto_h = st.text_input("Buscar por manifiesto", key="hist_manif")
+
+        estado_map = {"Todos": None, "Pendientes": "pendiente", "Legalizados": "legalizado"}
+        fi_h  = fecha_ini_h.strftime('%Y-%m-%d') if fecha_ini_h else None
+        ff_h  = fecha_fin_h.strftime('%Y-%m-%d') if fecha_fin_h else None
+        pl_h  = None if placa_h == "Todas" else placa_h
+        df_hist = db.buscar(estado=estado_map[estado_filtro], fecha_ini=fi_h, fecha_fin=ff_h,
+                            placa=pl_h, conductor=conductor_h or None, manifiesto=manifiesto_h.strip() or None)
+
+        if df_hist.empty:
+            st.info("No se encontraron viajes con los filtros aplicados.")
+        else:
+            total_anticipo = df_hist['valor_anticipo'].sum()
+            legalizados = int(df_hist['legalizado'].sum())
+            pendientes  = len(df_hist) - legalizados
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            col_m1.metric("Total viajes",    len(df_hist))
+            col_m2.metric("Legalizados",     legalizados)
+            col_m3.metric("Pendientes",      pendientes)
+            col_m4.metric("Total anticipos", f"${fmt(total_anticipo)}")
+
+            # ── NUEVO v17: observaciones incluida en la tabla del historial ──
+            cols_tabla = ['id','manifiesto','fecha_viaje','placa','conductor','cliente','origen',
+                          'destino','valor_anticipo','observaciones','legalizado','legalizado_por','fecha_legalizacion']
+            df_show = df_hist[[c for c in cols_tabla if c in df_hist.columns]].copy()
+            df_show['dias_alerta'] = df_hist.apply(
+                lambda r: "—" if r.get('legalizado') else badge_alerta(*clasificar_alerta(r['fecha_viaje'])), axis=1)
+            df_show['valor_anticipo'] = df_show['valor_anticipo'].apply(lambda x: f"${fmt(x)}")
+            df_show['legalizado'] = df_show['legalizado'].apply(lambda x: "✅ Legalizado" if x else "🔴 Pendiente")
+            df_show['fecha_viaje'] = df_show['fecha_viaje'].apply(fmt_fecha)
+            df_show['fecha_legalizacion'] = df_show['fecha_legalizacion'].apply(
+                lambda x: fmt_fecha(x) if pd.notna(x) and str(x) not in ['', 'None', 'NaT'] else "—"
+            )
+            df_show['observaciones'] = df_show['observaciones'].fillna('').apply(
+                lambda x: x if x else "—"
+            )
+            df_show.rename(columns={
+                'id':'ID','manifiesto':'Manifiesto','fecha_viaje':'Fecha viaje','placa':'Placa',
+                'conductor':'Conductor','cliente':'Cliente','origen':'Origen','destino':'Destino',
+                'valor_anticipo':'Anticipo','observaciones':'Observaciones','legalizado':'Estado',
+                'legalizado_por':'Legalizado por',
+                'fecha_legalizacion':'Fecha legalización','dias_alerta':'Alerta'
+            }, inplace=True)
+            st.dataframe(df_show, use_container_width=True, hide_index=True, height=350)
+
+            st.divider()
+            col_exp1, col_exp2 = st.columns([3, 1])
+            with col_exp1:
+                titulo_excel = st.text_input("Título del reporte Excel",
+                    value=f"Anticipos {estado_filtro} — {hora_colombia().strftime('%d/%m/%Y')}", key="titulo_excel")
+            with col_exp2:
+                st.markdown("&nbsp;")
+                excel_bytes = generar_excel(df_hist, titulo_excel)
+                st.download_button(label="📥 Exportar a Excel", data=excel_bytes,
+                    file_name=f"anticipos_{hora_colombia().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+
+            st.divider()
+            st.subheader("Acciones sobre un viaje")
+            viaje_sel = st.selectbox("Selecciona un viaje por ID", df_hist['id'].tolist(),
+                format_func=lambda x: (
+                    f"ID {x} | Manif: {df_hist[df_hist['id']==x]['manifiesto'].values[0] or '—'} | "
+                    f"{df_hist[df_hist['id']==x]['placa'].values[0]} | {df_hist[df_hist['id']==x]['conductor'].values[0]}"
+                ), key="hist_sel")
+            row_sel = df_hist[df_hist['id'] == viaje_sel].iloc[0]
+            col_det, col_acc = st.columns([3, 1])
+            with col_det:
+                estado_tag = "✅ **LEGALIZADO**" if row_sel['legalizado'] else "🔴 **PENDIENTE**"
+                st.markdown(f"**Estado:** {estado_tag}")
+                st.write(f"📄 Manifiesto: **{row_sel.get('manifiesto', '—')}**")
+                st.write(f"Fecha: {fmt_fecha(row_sel['fecha_viaje'])} | Placa: {row_sel['placa']} | Conductor: {row_sel['conductor']}")
+                st.write(f"Ruta: {row_sel['origen']} → {row_sel['destino']} | Anticipo: **${fmt(row_sel['valor_anticipo'])} COP**")
+                # ── NUEVO v17: observaciones del viaje en acciones ──
+                if row_sel.get('observaciones'):
+                    st.info(f"📝 Observaciones: {row_sel['observaciones']}")
+                if row_sel['legalizado']:
+                    st.success(f"Legalizado por: **{row_sel['legalizado_por']}** | Fecha: {fmt_fecha(row_sel['fecha_legalizacion'])}")
+            with col_acc:
+                if st.button("✏️ Editar viaje", key="btn_editar"):
+                    st.session_state.editando_id = viaje_sel; st.rerun()
+                if st.session_state.confirmar_eliminar == viaje_sel:
+                    st.warning(f"¿Eliminar ID **{viaje_sel}**?")
+                    c_si, c_no = st.columns(2)
+                    with c_si:
+                        if st.button("Sí", key="btn_si_eliminar", type="primary"):
+                            db.eliminar(viaje_sel); st.session_state.confirmar_eliminar = None
+                            st.success("Eliminado."); st.rerun()
+                    with c_no:
+                        if st.button("Cancelar", key="btn_no_eliminar"):
+                            st.session_state.confirmar_eliminar = None; st.rerun()
+                else:
+                    if st.button("🗑️ Eliminar viaje", key="btn_eliminar", type="secondary"):
+                        st.session_state.confirmar_eliminar = viaje_sel; st.rerun()
+
+        if st.session_state.editando_id is not None:
+            eid = st.session_state.editando_id
+            viaje_edit = db.obtener_por_id(eid)
+            if viaje_edit is not None:
+                st.divider()
+                st.subheader(f"✏️ Editando viaje ID {eid}")
+                lista_clientes_edit = get_lista_clientes(db)
+                cliente_actual = viaje_edit['cliente']
+                if cliente_actual not in lista_clientes_edit: lista_clientes_edit = [cliente_actual] + lista_clientes_edit
+                idx_cliente = lista_clientes_edit.index(cliente_actual)
+                lista_conductores_edit = get_lista_conductores(db)
+                conductor_actual = viaje_edit['conductor']
+                if conductor_actual not in lista_conductores_edit: lista_conductores_edit = [conductor_actual] + lista_conductores_edit
+                idx_conductor_edit = lista_conductores_edit.index(conductor_actual)
+                idx_placa_edit = PLACAS.index(viaje_edit['placa']) if viaje_edit['placa'] in PLACAS else 0
+
+                with st.form(f"form_editar_{eid}"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        fecha_e     = st.date_input("Fecha del viaje", value=pd.to_datetime(viaje_edit['fecha_viaje']).date())
+                        placa_e     = st.selectbox("Placa", PLACAS, index=idx_placa_edit)
+                        conductor_e = st.selectbox("Conductor", lista_conductores_edit, index=idx_conductor_edit)
+                        cliente_e   = st.selectbox("Cliente", lista_clientes_edit, index=idx_cliente)
+                        manifiesto_e = st.text_input("Número de manifiesto ✱", value=viaje_edit.get('manifiesto','') or '')
+                    with col2:
+                        origen_e  = st.text_input("Origen",  value=viaje_edit['origen'])
+                        destino_e = st.text_input("Destino", value=viaje_edit['destino'])
+                        anticipo_e_txt = st.text_input("Valor del anticipo (COP)", value=fmt(viaje_edit['valor_anticipo']))
+                        anticipo_e = limpiar(anticipo_e_txt)
+                        obs_e = st.text_area("Observaciones", value=viaje_edit.get('observaciones','') or '', height=80)
+                    col_g, col_c = st.columns(2)
+                    with col_g: guardar_edit  = st.form_submit_button("💾 Guardar cambios", type="primary")
+                    with col_c: cancelar_edit = st.form_submit_button("✖ Cancelar")
+                    if guardar_edit:
+                        errores_e = []
+                        if not manifiesto_e.strip(): errores_e.append("Manifiesto obligatorio")
+                        if not origen_e.strip():     errores_e.append("Origen obligatorio")
+                        if not destino_e.strip():    errores_e.append("Destino obligatorio")
+                        if anticipo_e <= 0:          errores_e.append("Anticipo debe ser mayor a 0")
+                        if errores_e:
+                            for err in errores_e: st.error(f"⚠️ {err}")
+                        else:
+                            ok = db.editar_viaje(eid, {
+                                'fecha_viaje': fecha_e, 'placa': placa_e,
+                                'conductor': conductor_e.strip().upper(),
+                                'cliente': cliente_e.strip().upper(),
+                                'origen': origen_e.strip().upper(),
+                                'destino': destino_e.strip().upper(),
+                                'valor_anticipo': anticipo_e,
+                                'observaciones': obs_e.strip(),
+                                'manifiesto': manifiesto_e.strip()
+                            })
+                            if ok:
+                                st.success(f"✅ Viaje ID {eid} actualizado."); st.session_state.editando_id = None; st.rerun()
+                    if cancelar_edit:
+                        st.session_state.editando_id = None; st.rerun()
+
+    # ==================== TAB 4: VACACIONES v16 ====================
+    with tab_vac:
+        st.header("🏖️ Control de Vacaciones")
+        st.caption(f"Regla: {DIAS_VACACIONES_ANUALES} días de vacaciones por cada año laboral completado.")
+
+        lista_conductores_vac = get_lista_conductores(db)
+        df_info_todos         = db.obtener_todos_info_conductores()
+        df_vac_todos          = db.obtener_vacaciones()
+        df_pagos_vac_todos    = db.obtener_pagos_vacaciones()
+        hoy                   = hora_colombia().date()
+
+        v_tab1, v_tab2, v_tab3 = st.tabs([
+            "📊 Resumen y saldos",
+            "📝 Registrar vacaciones tomadas",
+            "⚙️ Fecha de ingreso"
+        ])
+
+        # ======================== RESUMEN Y SALDOS ========================
+        with v_tab1:
+
+            col_f1v, col_f2v = st.columns(2)
+            with col_f1v:
+                filtro_cond_vac = st.selectbox(
+                    "Filtrar por conductor",
+                    ["Todos"] + lista_conductores_vac,
+                    key="vac_filtro_cond"
+                )
+            with col_f2v:
+                filtro_estado_vac = st.selectbox(
+                    "Filtrar por estado",
+                    ["Todos", "🔴 Con días pendientes", "✅ Al día / Sin períodos", "⚪ Sin fecha ingreso"],
+                    key="vac_filtro_estado"
+                )
+
+            conductores_mostrar = lista_conductores_vac if filtro_cond_vac == "Todos" else [filtro_cond_vac]
+
+            filas = []
+            for cond in conductores_mostrar:
+                info_row = df_info_todos[df_info_todos["conductor"] == cond].iloc[0] \
+                    if not df_info_todos.empty and (df_info_todos["conductor"] == cond).any() else None
+
+                if info_row is not None and info_row.get("fecha_ingreso") is not None:
+                    fi = pd.to_datetime(info_row["fecha_ingreso"]).date()
+                    calc = calcular_vacaciones(cond, fi, df_vac_todos, hoy)
+
+                    pagos_cond_df = df_pagos_vac_todos[df_pagos_vac_todos["conductor"] == cond] \
+                        if not df_pagos_vac_todos.empty else pd.DataFrame()
+                    anios_pagados_dinero = set(pagos_cond_df["anio_laboral"].tolist()) \
+                        if not pagos_cond_df.empty else set()
+
+                    hay_pendiente_real = any(
+                        p["anio"] not in anios_pagados_dinero and (
+                            DIAS_VACACIONES_ANUALES - sum(
+                                int(r.get("dias", 0)) for r in calc["registros"]
+                                if r.get("fecha_inicio") is not None and (
+                                    pd.to_datetime(r["fecha_inicio"]).date() >= p["inicio"]
+                                    and pd.to_datetime(r["fecha_inicio"]).date() < p["fin"]
+                                )
+                            )
+                        ) > 0
+                        for p in calc["periodos"]
+                    )
+
+                    if hay_pendiente_real:
+                        estado_v = "pendientes"
+                    elif calc["anios_completos"] > 0:
+                        estado_v = "al_dia"
+                    else:
+                        estado_v = "sin_periodos"
+
+                    filas.append({
+                        "conductor": cond,
+                        "fecha_ingreso": fi,
+                        "calc": calc,
+                        "estado_v": estado_v,
+                        "anios_pagados_dinero": anios_pagados_dinero,
+                        "pagos_cond_df": pagos_cond_df,
+                    })
+                else:
+                    filas.append({
+                        "conductor": cond,
+                        "fecha_ingreso": None,
+                        "calc": None,
+                        "estado_v": "sin_fecha",
+                        "anios_pagados_dinero": set(),
+                        "pagos_cond_df": pd.DataFrame(),
+                    })
+
+            if filtro_estado_vac == "🔴 Con días pendientes":
+                filas = [f for f in filas if f["estado_v"] == "pendientes"]
+            elif filtro_estado_vac == "✅ Al día / Sin períodos":
+                filas = [f for f in filas if f["estado_v"] in ("al_dia", "sin_periodos")]
+            elif filtro_estado_vac == "⚪ Sin fecha ingreso":
+                filas = [f for f in filas if f["estado_v"] == "sin_fecha"]
+
+            con_pendientes = sum(1 for f in filas if f["estado_v"] == "pendientes")
+            al_dia_count   = sum(1 for f in filas if f["estado_v"] in ("al_dia", "sin_periodos"))
+            sin_fecha_c    = sum(1 for f in filas if f["estado_v"] == "sin_fecha")
+            total_dias_pendientes = sum(
+                f["calc"]["dias_vencidos"] for f in filas
+                if f["calc"] and f["calc"]["dias_vencidos"] > 0
+            )
+
+            col_mv1, col_mv2, col_mv3, col_mv4 = st.columns(4)
+            col_mv1.metric("Conductores mostrados", len(filas))
+            col_mv2.metric("🔴 Con días pendientes", con_pendientes)
+            col_mv3.metric("✅ Al día",              al_dia_count)
+            col_mv4.metric("Días totales pendientes", total_dias_pendientes)
+
+            if con_pendientes > 0:
+                nombres_pendientes = [f["conductor"] for f in filas if f["estado_v"] == "pendientes"]
+                st.error(f"🚨 {con_pendientes} conductor(es) con vacaciones pendientes: " + ", ".join(nombres_pendientes))
+
+            st.divider()
+
+            for fila in filas:
+                cond              = fila["conductor"]
+                calc              = fila["calc"]
+                estado_v          = fila["estado_v"]
+                anios_pagados_din = fila["anios_pagados_dinero"]
+                pagos_cond_df     = fila["pagos_cond_df"]
+
+                if estado_v == "pendientes":
+                    label_v = (
+                        f"🔴  {cond}  |  "
+                        f"{calc['dias_vencidos']} días pendientes  |  "
+                        f"{calc['dias_generados']} generados — {calc['dias_usados']} usados  |  "
+                        f"Próxima vacación: {calc['proxima_fecha'].strftime('%d/%m/%Y')}"
+                    )
+                elif estado_v == "al_dia":
+                    label_v = (
+                        f"✅  {cond}  |  Al día  |  "
+                        f"{calc['dias_generados']} generados — {calc['dias_usados']} usados  |  "
+                        f"Próxima vacación: {calc['proxima_fecha'].strftime('%d/%m/%Y')} "
+                        f"(en {calc['dias_para_proxima']} días)"
+                    )
+                elif estado_v == "sin_periodos":
+                    label_v = (
+                        f"🟢  {cond}  |  Menos de 1 año  |  "
+                        f"Primera vacación: {calc['proxima_fecha'].strftime('%d/%m/%Y')} "
+                        f"(en {calc['dias_para_proxima']} días)"
+                    )
+                else:
+                    label_v = f"⚪  {cond}  |  Sin fecha de ingreso registrada"
+
+                with st.expander(label_v):
+
+                    if estado_v == "sin_fecha":
+                        st.warning("⚠️ Registra la fecha de ingreso del conductor en la pestaña **⚙️ Fecha de ingreso**.")
+                        continue
+
+                    col_va, col_vb = st.columns([3, 2])
+
+                    with col_va:
+                        st.write(f"**Ingreso:** {fila['fecha_ingreso'].strftime('%d/%m/%Y')}")
+
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Años completados",  calc["anios_completos"])
+                        m2.metric("Días generados",    calc["dias_generados"])
+                        m3.metric("Días usados",       calc["dias_usados"])
+                        if calc["dias_vencidos"] > 0:
+                            m4.metric("🔴 Días pendientes", calc["dias_vencidos"])
+                        else:
+                            m4.metric("✅ Días pendientes", 0)
+
+                        if estado_v == "pendientes":
+                            st.error(
+                                f"⏰ Este conductor tiene **{calc['dias_vencidos']} días** de vacaciones "
+                                f"sin tomar, generados en {calc['anios_completos']} año(s) laborales."
+                            )
+                        elif calc["anios_completos"] > 0:
+                            st.success("✅ Todos los días de vacaciones están utilizados o pagados.")
+                        else:
+                            st.info("⏳ Aún no completa su primer año laboral.")
+
+                        if calc["dias_para_proxima"] <= 30:
+                            st.warning(
+                                f"📆 Próxima vacación: **{calc['proxima_fecha'].strftime('%d/%m/%Y')}** "
+                                f"— ¡faltan solo **{calc['dias_para_proxima']} días**!"
+                            )
+                        else:
+                            st.info(
+                                f"📆 Próxima vacación: **{calc['proxima_fecha'].strftime('%d/%m/%Y')}** "
+                                f"(en {calc['dias_para_proxima']} días)"
+                            )
+
+                        if calc["periodos"]:
+                            st.markdown("**Períodos anuales completados:**")
+                            for p in calc["periodos"]:
+                                anio_num = p["anio"]
+
+                                regs_periodo = [
+                                    r for r in calc["registros"]
+                                    if r.get("fecha_inicio") is not None and (
+                                        pd.to_datetime(r["fecha_inicio"]).date() >= p["inicio"]
+                                        and pd.to_datetime(r["fecha_inicio"]).date() < p["fin"]
+                                    )
+                                ]
+                                dias_tomados  = sum(int(r.get("dias", 0)) for r in regs_periodo)
+                                dias_pend_p   = DIAS_VACACIONES_ANUALES - dias_tomados
+
+                                pago_row = pagos_cond_df[pagos_cond_df["anio_laboral"] == anio_num] \
+                                    if not pagos_cond_df.empty else pd.DataFrame()
+                                pagado_en_dinero = not pago_row.empty
+                                monto_pago_din   = int(pago_row.iloc[0]["monto_cop"]) if pagado_en_dinero else 0
+                                fecha_pago_din   = fmt_fecha(pago_row.iloc[0]["fecha_pago"]) if pagado_en_dinero else "—"
+                                reg_por_din      = str(pago_row.iloc[0].get("registrado_por","")) if pagado_en_dinero else ""
+                                pago_vac_id      = int(pago_row.iloc[0]["id"]) if pagado_en_dinero else None
+
+                                if dias_pend_p <= 0 and not pagado_en_dinero:
+                                    st.success(
+                                        f"✅ **{p['label']}** — "
+                                        f"{dias_tomados} días tomados físicamente. Período completo."
+                                    )
+                                elif dias_pend_p <= 0 and pagado_en_dinero:
+                                    st.success(
+                                        f"✅ **{p['label']}** — "
+                                        f"{dias_tomados} días tomados. Pago registrado: ${fmt(monto_pago_din)} COP "
+                                        f"({fecha_pago_din}). Período completo."
+                                    )
+                                elif pagado_en_dinero and dias_pend_p > 0:
+                                    st.info(
+                                        f"💵 **{p['label']}** — "
+                                        f"{dias_tomados} días tomados físicamente · "
+                                        f"**{dias_pend_p} días pendientes de tomar** · "
+                                        f"Pago en dinero: ${fmt(monto_pago_din)} COP · "
+                                        f"Fecha pago: {fecha_pago_din}"
+                                        + (f" · Registrado por: {reg_por_din}" if reg_por_din else "")
+                                    )
+                                    st.caption(
+                                        "ℹ️ Pago registrado, pero aún faltan vacaciones físicas por tomar."
+                                    )
+                                elif dias_tomados > 0 and dias_pend_p > 0 and not pagado_en_dinero:
+                                    st.warning(
+                                        f"🟡 **{p['label']}** — "
+                                        f"{dias_tomados} días tomados · "
+                                        f"**{dias_pend_p} días pendientes** · "
+                                        f"Faltan vacaciones o pago en dinero"
+                                    )
+                                else:
+                                    st.error(
+                                        f"🔴 **{p['label']}** — "
+                                        f"0 días tomados · "
+                                        f"**{dias_pend_p} días pendientes** · "
+                                        f"Sin vacaciones ni pago registrado"
+                                    )
+
+                                widget_pago_vacacion(
+                                    db, cond, anio_num, p, dias_pend_p,
+                                    pagado_en_dinero, monto_pago_din,
+                                    fecha_pago_din, reg_por_din, pago_vac_id
+                                )
+                                st.markdown("---")
+
+                    with col_vb:
+                        st.markdown("**Vacaciones registradas (tomadas):**")
+                        df_vac_cond = df_vac_todos[df_vac_todos["conductor"] == cond] \
+                            if not df_vac_todos.empty else pd.DataFrame()
+
+                        if df_vac_cond.empty:
+                            st.info("No hay vacaciones registradas para este conductor.")
+                        else:
+                            for _, vrow in df_vac_cond.sort_values("fecha_inicio", ascending=False).iterrows():
+                                vid = vrow['id']
+
+                                if st.session_state.editando_vac_id == vid:
+                                    with st.form(f"form_edit_vac_{vid}"):
+                                        st.markdown(f"**Editando ID {vid}**")
+                                        col_ev1, col_ev2 = st.columns(2)
+                                        with col_ev1:
+                                            fi_edit = st.date_input(
+                                                "Fecha inicio",
+                                                value=pd.to_datetime(vrow['fecha_inicio']).date(),
+                                                key=f"fi_edit_{vid}"
+                                            )
+                                            ff_edit = st.date_input(
+                                                "Fecha fin",
+                                                value=pd.to_datetime(vrow['fecha_fin']).date(),
+                                                key=f"ff_edit_{vid}"
+                                            )
+                                        with col_ev2:
+                                            dias_edit = st.number_input(
+                                                "Días", min_value=1, max_value=60,
+                                                value=min(int(vrow['dias']), 60),
+                                                key=f"d_edit_{vid}"
+                                            )
+                                            obs_edit = st.text_area(
+                                                "Observaciones",
+                                                value=vrow.get('observaciones','') or '',
+                                                height=60, key=f"obs_edit_{vid}"
+                                            )
+                                        col_ge, col_ce = st.columns(2)
+                                        with col_ge:
+                                            guardar_vac = st.form_submit_button("💾 Guardar", type="primary")
+                                        with col_ce:
+                                            cancelar_vac = st.form_submit_button("✖ Cancelar")
+
+                                        if guardar_vac:
+                                            ok_ev = db.actualizar_vacacion(vid, {
+                                                'fecha_inicio': fi_edit,
+                                                'fecha_fin': ff_edit,
+                                                'dias': dias_edit,
+                                                'observaciones': obs_edit.strip()
+                                            })
+                                            if ok_ev:
+                                                st.session_state.editando_vac_id = None
+                                                st.success("✅ Actualizado.")
+                                                st.rerun()
+                                        if cancelar_vac:
+                                            st.session_state.editando_vac_id = None
+                                            st.rerun()
+
+                                else:
+                                    fi_str  = fmt_fecha(vrow['fecha_inicio'])
+                                    ff_str  = fmt_fecha(vrow['fecha_fin'])
+                                    obs_str = vrow.get('observaciones','') or '—'
+                                    st.write(
+                                        f"📆 {fi_str} → {ff_str}  |  "
+                                        f"**{vrow['dias']} días**  |  {obs_str}"
+                                    )
+
+                                    col_ve, col_vd = st.columns([1, 1])
+                                    with col_ve:
+                                        if st.button("✏️ Editar", key=f"edit_vac_{vid}"):
+                                            st.session_state.editando_vac_id = vid
+                                            st.rerun()
+                                    with col_vd:
+                                        if st.session_state.confirmar_eliminar_vac == vid:
+                                            st.warning("¿Confirmar eliminación?")
+                                            col_si_v, col_no_v = st.columns(2)
+                                            with col_si_v:
+                                                if st.button("✅ Sí", key=f"si_vac_{vid}", type="primary"):
+                                                    db.eliminar_vacacion(vid)
+                                                    st.session_state.confirmar_eliminar_vac = None
+                                                    st.rerun()
+                                            with col_no_v:
+                                                if st.button("❌ No", key=f"no_vac_{vid}"):
+                                                    st.session_state.confirmar_eliminar_vac = None
+                                                    st.rerun()
+                                        else:
+                                            if st.button("🗑️ Eliminar", key=f"del_vac_{vid}"):
+                                                st.session_state.confirmar_eliminar_vac = vid
+                                                st.rerun()
+
+                                    st.divider()
+
+            st.divider()
+            excel_vac = generar_excel_vacaciones(df_info_todos, df_vac_todos, df_pagos_vac_todos, lista_conductores_vac)
+            st.download_button(
+                label="📥 Exportar vacaciones a Excel",
+                data=excel_vac,
+                file_name=f"vacaciones_{hora_colombia().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
+
+        # ======================== REGISTRAR VACACIONES TOMADAS ========================
+        with v_tab2:
+            st.subheader("Registrar vacaciones tomadas")
+            st.caption("Aquí registras los días que el conductor YA tomó de vacaciones.")
+
+            col_sel, _ = st.columns([2, 2])
+            with col_sel:
+                cond_sel = st.selectbox("Conductor", lista_conductores_vac, key="vac_cond_reg")
+
+            info_cond = df_info_todos[df_info_todos["conductor"] == cond_sel].iloc[0] \
+                if not df_info_todos.empty and (df_info_todos["conductor"] == cond_sel).any() else None
+
+            if info_cond is None or info_cond.get("fecha_ingreso") is None:
+                st.warning(f"⚠️ **{cond_sel}** no tiene fecha de ingreso. Regístrala primero en **⚙️ Fecha de ingreso**.")
+            else:
+                fi_cond = pd.to_datetime(info_cond["fecha_ingreso"]).date()
+                calc_preview = calcular_vacaciones(cond_sel, fi_cond, df_vac_todos, hoy)
+
+                col_p1, col_p2, col_p3, col_p4 = st.columns(4)
+                col_p1.metric("Años completados",  calc_preview["anios_completos"])
+                col_p2.metric("Días generados",    calc_preview["dias_generados"])
+                col_p3.metric("Días usados",       calc_preview["dias_usados"])
+                col_p4.metric("Días disponibles",  calc_preview["dias_vencidos"])
+
+                if calc_preview["anios_completos"] == 0:
+                    st.info(
+                        f"⏳ **{cond_sel}** aún no ha completado su primer año. "
+                        f"Primera vacación disponible: **{calc_preview['proxima_fecha'].strftime('%d/%m/%Y')}**"
+                    )
+                elif calc_preview["dias_vencidos"] == 0:
+                    st.success(f"✅ **{cond_sel}** tiene todos sus días de vacaciones utilizados.")
+                else:
+                    st.warning(
+                        f"⚠️ **{cond_sel}** tiene **{calc_preview['dias_vencidos']} días** "
+                        f"de vacaciones sin registrar."
+                    )
+
+                st.divider()
+                with st.form("form_vacacion_v16", clear_on_submit=True):
+                    col1v, col2v = st.columns(2)
+                    with col1v:
+                        fi_vac = st.date_input("Fecha inicio vacaciones", value=datetime.today())
+                        ff_vac = st.date_input("Fecha fin vacaciones",    value=datetime.today())
+                    with col2v:
+                        dias_auto = max(1, (ff_vac - fi_vac).days + 1) if ff_vac >= fi_vac else 1
+                        st.metric("Días calculados automáticamente", dias_auto)
+                        dias_vac  = st.number_input(
+                            "Días (ajustable manualmente)",
+                            min_value=1,
+                            max_value=60,
+                            value=min(int(dias_auto), 60)
+                        )
+                        reg_por_v = st.text_input("Registrado por", placeholder="Tu nombre completo")
+                        obs_vac   = st.text_area("Observaciones", height=80)
+
+                    submitted_vac = st.form_submit_button("💾 Registrar", type="primary")
+                    if submitted_vac:
+                        if not reg_por_v.strip():
+                            st.error("⚠️ Ingresa tu nombre.")
+                        elif ff_vac < fi_vac:
+                            st.error("⚠️ La fecha fin no puede ser anterior a la fecha inicio.")
+                        else:
+                            nuevo_id_v = db.registrar_vacacion({
+                                'conductor': cond_sel,
+                                'fecha_inicio': fi_vac,
+                                'fecha_fin': ff_vac,
+                                'dias': dias_vac,
+                                'anio_laboral': None,
+                                'observaciones': obs_vac.strip(),
+                                'registrado_por': reg_por_v.strip()
+                            })
+                            if nuevo_id_v:
+                                st.success(
+                                    f"✅ Vacaciones registradas para **{cond_sel}**: "
+                                    f"{fi_vac.strftime('%d/%m/%Y')} → {ff_vac.strftime('%d/%m/%Y')} "
+                                    f"({dias_vac} días)"
+                                )
+                                st.rerun()
+
+                st.divider()
+                st.subheader(f"Historial de vacaciones — {cond_sel}")
+                df_hist_cond = df_vac_todos[df_vac_todos["conductor"] == cond_sel] \
+                    if not df_vac_todos.empty else pd.DataFrame()
+                if df_hist_cond.empty:
+                    st.info("Sin registros de vacaciones aún.")
+                else:
+                    df_hist_show = df_hist_cond[["id","fecha_inicio","fecha_fin","dias","observaciones","registrado_por"]].copy()
+                    df_hist_show["fecha_inicio"] = df_hist_show["fecha_inicio"].apply(fmt_fecha)
+                    df_hist_show["fecha_fin"]    = df_hist_show["fecha_fin"].apply(fmt_fecha)
+                    df_hist_show.columns = ["ID","Inicio","Fin","Días","Observaciones","Registrado por"]
+                    st.dataframe(df_hist_show, use_container_width=True, hide_index=True)
+
+        # ======================== FECHA DE INGRESO ========================
+        with v_tab3:
+            st.subheader("⚙️ Registrar / actualizar fecha de ingreso")
+            st.caption("La fecha de ingreso es la base para calcular los años laborales y los días de vacaciones.")
+
+            with st.form("form_fecha_ingreso", clear_on_submit=True):
+                col1fi, col2fi = st.columns(2)
+                with col1fi:
+                    cond_fi   = st.selectbox("Conductor", lista_conductores_vac, key="fi_cond")
+                    fecha_ing = st.date_input("Fecha de ingreso / contratación", value=datetime.today())
+                with col2fi:
+                    obs_fi = st.text_area("Observaciones", height=80)
+
+                if st.form_submit_button("💾 Guardar", type="primary"):
+                    ok_fi = db.guardar_info_conductor(cond_fi, fecha_ing, obs_fi)
+                    if ok_fi:
+                        st.success(f"✅ Fecha de ingreso de **{cond_fi}** guardada: **{fecha_ing.strftime('%d/%m/%Y')}**")
+                        st.rerun()
+
+            st.divider()
+
+            st.subheader("Fechas registradas — editar directamente")
+            st.caption("Haz clic en ✏️ para editar la fecha de ingreso de cualquier conductor.")
+
+            df_info_show = db.obtener_todos_info_conductores()
+            if df_info_show.empty:
+                st.info("No hay fechas de ingreso registradas.")
+            else:
+                for _, irow in df_info_show.iterrows():
+                    cond_nombre = irow['conductor']
+                    fi_d = pd.to_datetime(irow['fecha_ingreso']).date()
+                    anios_t = round((hoy - fi_d).days / 365.25, 1)
+                    calc_r  = calcular_vacaciones(cond_nombre, fi_d, df_vac_todos, hoy)
+
+                    if calc_r["dias_vencidos"] > 0:
+                        icono = "🔴"
+                    elif calc_r["anios_completos"] > 0:
+                        icono = "✅"
+                    else:
+                        icono = "🟢"
+
+                    if st.session_state.editando_fecha_ingreso_conductor == cond_nombre:
+                        with st.form(f"form_edit_fi_{cond_nombre}"):
+                            st.markdown(f"**✏️ Editando fecha de ingreso: {cond_nombre}**")
+                            col_efi1, col_efi2, col_efi3 = st.columns([2, 2, 2])
+                            with col_efi1:
+                                nueva_fecha_fi = st.date_input(
+                                    "Nueva fecha de ingreso",
+                                    value=fi_d,
+                                    key=f"nueva_fi_{cond_nombre}"
+                                )
+                            with col_efi2:
+                                nueva_obs_fi = st.text_input(
+                                    "Observaciones",
+                                    value=irow.get('observaciones','') or '',
+                                    key=f"nueva_obs_fi_{cond_nombre}"
+                                )
+                            with col_efi3:
+                                st.markdown("&nbsp;")
+                            col_gfi, col_cfi = st.columns([1, 1])
+                            with col_gfi:
+                                guardar_fi_edit = st.form_submit_button("💾 Guardar cambio", type="primary")
+                            with col_cfi:
+                                cancelar_fi_edit = st.form_submit_button("✖ Cancelar")
+
+                            if guardar_fi_edit:
+                                ok_efi = db.guardar_info_conductor(cond_nombre, nueva_fecha_fi, nueva_obs_fi)
+                                if ok_efi:
+                                    st.success(
+                                        f"✅ Fecha de ingreso de **{cond_nombre}** actualizada a "
+                                        f"**{nueva_fecha_fi.strftime('%d/%m/%Y')}**"
+                                    )
+                                    st.session_state.editando_fecha_ingreso_conductor = None
+                                    st.rerun()
+                            if cancelar_fi_edit:
+                                st.session_state.editando_fecha_ingreso_conductor = None
+                                st.rerun()
+                    else:
+                        col_info_fi, col_btn_fi = st.columns([6, 1])
+                        with col_info_fi:
+                            st.write(
+                                f"{icono} **{cond_nombre}** — "
+                                f"Ingreso: **{fi_d.strftime('%d/%m/%Y')}** — "
+                                f"Antigüedad: {anios_t} años — "
+                                f"Años completos: **{calc_r['anios_completos']}** — "
+                                f"Días generados: **{calc_r['dias_generados']}** — "
+                                f"Días usados: **{calc_r['dias_usados']}** — "
+                                f"Días pendientes: **{calc_r['dias_vencidos']}** — "
+                                f"Próxima vacación: **{calc_r['proxima_fecha'].strftime('%d/%m/%Y')}** "
+                                f"(en {calc_r['dias_para_proxima']} días)"
+                                + (f"  |  {irow['observaciones']}" if irow.get('observaciones') else "")
+                            )
+                        with col_btn_fi:
+                            if st.button("✏️ Editar", key=f"btn_edit_fi_{cond_nombre}"):
+                                st.session_state.editando_fecha_ingreso_conductor = cond_nombre
+                                st.rerun()
+
+    # ==================== TAB 5: PRÉSTAMOS ====================
+    with tab_prest:
+        st.header("💰 Gestión de Préstamos a Conductores")
+        lista_conductores_prest = get_lista_conductores(db)
+
+        p_tab1, p_tab2, p_tab3 = st.tabs(["📊 Resumen y trazabilidad", "➕ Nuevo préstamo", "💳 Registrar pago/descuento"])
+
+        with p_tab1:
+            st.subheader("Estado de préstamos")
+            col_fp1, col_fp2, col_fp3 = st.columns(3)
+            with col_fp1: filtro_cond_p  = st.selectbox("Conductor", ["Todos"] + lista_conductores_prest, key="p_filtro_cond")
+            with col_fp2: filtro_estado_p = st.selectbox("Estado", ["Todos","activo","saldado"], key="p_filtro_estado")
+            with col_fp3: filtro_fecha_p  = st.date_input("Préstamos desde", value=None, key="p_filtro_fecha")
+
+            cond_p_q = None if filtro_cond_p == "Todos" else filtro_cond_p
+            est_p_q  = None if filtro_estado_p == "Todos" else filtro_estado_p
+            df_prestamos_all = db.obtener_prestamos(conductor=cond_p_q, estado=est_p_q)
+            df_pagos_all     = db.obtener_pagos()
+
+            if filtro_fecha_p and not df_prestamos_all.empty:
+                df_prestamos_all = df_prestamos_all[pd.to_datetime(df_prestamos_all["fecha_prestamo"]).dt.date >= filtro_fecha_p]
+
+            if df_prestamos_all.empty:
+                st.info("No se encontraron préstamos con los filtros aplicados.")
+            else:
+                total_prestado = int(df_prestamos_all["monto_total"].sum())
+                total_pagado_g = 0; total_saldo_g = 0; activos_g = 0; saldados_g = 0
+                for _, pr in df_prestamos_all.iterrows():
+                    pagado, saldo = calcular_saldo_prestamo(pr['id'], pr['monto_total'], df_pagos_all)
+                    total_pagado_g += pagado; total_saldo_g += saldo
+                    if pr['estado'] == 'activo': activos_g += 1
+                    else: saldados_g += 1
+
+                col_pm1, col_pm2, col_pm3, col_pm4 = st.columns(4)
+                col_pm1.metric("Total prestado",  f"${fmt(total_prestado)}")
+                col_pm2.metric("Total pagado",    f"${fmt(total_pagado_g)}")
+                col_pm3.metric("Saldo pendiente", f"${fmt(total_saldo_g)}")
+                col_pm4.metric("Activos / Saldados", f"{activos_g} / {saldados_g}")
+
+                st.divider()
+                for _, pr in df_prestamos_all.iterrows():
+                    pagado, saldo = calcular_saldo_prestamo(pr['id'], pr['monto_total'], df_pagos_all)
+                    pct = round(pagado / pr['monto_total'] * 100) if pr['monto_total'] > 0 else 0
+                    paz_salvo = pr['estado'] == 'saldado' or saldo == 0
+                    icono_p = "✅" if paz_salvo else "🔴"
+                    label_p = (f"{icono_p} ID {pr['id']} | {pr['conductor']} | "
+                               f"${fmt(pr['monto_total'])} | Pagado: ${fmt(pagado)} | Saldo: ${fmt(saldo)} | {pct}%")
+
+                    with st.expander(label_p):
+                        col_pa, col_pb = st.columns([2, 2])
+                        with col_pa:
+                            st.write(f"💰 Monto: **${fmt(pr['monto_total'])} COP** | Pagado: **${fmt(pagado)}** | Saldo: **${fmt(saldo)}**")
+                            if saldo > 0: st.error(f"Saldo pendiente: **${fmt(saldo)} COP**")
+                            else: st.success("✅ PAZ Y SALVO")
+                            st.progress(min(pct, 100) / 100, text=f"{pct}%")
+                            if pr.get('motivo'): st.write(f"📝 {pr['motivo']}")
+                            if not paz_salvo:
+                                col_btna, col_btnb = st.columns(2)
+                                with col_btna:
+                                    if st.button("✅ Paz y Salvo", key=f"paz_{pr['id']}", type="primary"):
+                                        db.actualizar_estado_prestamo(pr['id'], 'saldado'); st.rerun()
+                                with col_btnb:
+                                    if st.session_state.confirmar_eliminar_prestamo == pr['id']:
+                                        st.warning("¿Eliminar?")
+                                        c_s2, c_n2 = st.columns(2)
+                                        with c_s2:
+                                            if st.button("Sí", key=f"si_prest_{pr['id']}"):
+                                                db.eliminar_prestamo(pr['id'])
+                                                st.session_state.confirmar_eliminar_prestamo = None; st.rerun()
+                                        with c_n2:
+                                            if st.button("No", key=f"no_prest_{pr['id']}"):
+                                                st.session_state.confirmar_eliminar_prestamo = None; st.rerun()
+                                    else:
+                                        if st.button("🗑️ Eliminar", key=f"del_prest_{pr['id']}"):
+                                            st.session_state.confirmar_eliminar_prestamo = pr['id']; st.rerun()
+                            else:
+                                if st.button("↩️ Reabrir", key=f"reabrir_{pr['id']}"):
+                                    db.actualizar_estado_prestamo(pr['id'], 'activo'); st.rerun()
+                        with col_pb:
+                            st.markdown("**Historial de pagos:**")
+                            df_pagos_p = df_pagos_all[df_pagos_all["prestamo_id"] == pr['id']] if not df_pagos_all.empty else pd.DataFrame()
+                            if df_pagos_p.empty:
+                                st.info("Sin pagos registrados.")
+                            else:
+                                saldo_acum = int(pr['monto_total'])
+                                for _, pg in df_pagos_p.sort_values("fecha_pago").iterrows():
+                                    saldo_acum -= int(pg['monto_pago'])
+                                    col_pgr = st.columns([3, 1])
+                                    with col_pgr[0]:
+                                        st.write(f"💳 {fmt_fecha(pg['fecha_pago'])} — ${fmt(pg['monto_pago'])} — Saldo: ${fmt(max(0,saldo_acum))}")
+                                    with col_pgr[1]:
+                                        if st.session_state.confirmar_eliminar_pago == pg['id']:
+                                            c_s3, c_n3 = st.columns(2)
+                                            with c_s3:
+                                                if st.button("Sí", key=f"si_pago_{pg['id']}"):
+                                                    db.eliminar_pago(pg['id'])
+                                                    st.session_state.confirmar_eliminar_pago = None; st.rerun()
+                                            with c_n3:
+                                                if st.button("No", key=f"no_pago_{pg['id']}"):
+                                                    st.session_state.confirmar_eliminar_pago = None; st.rerun()
+                                        else:
+                                            if st.button("🗑️", key=f"del_pago_{pg['id']}"):
+                                                st.session_state.confirmar_eliminar_pago = pg['id']; st.rerun()
+
+                st.divider()
+                _, col_exp_p2 = st.columns([3, 1])
+                with col_exp_p2:
+                    df_pagos_export = db.obtener_pagos()
+                    excel_p = generar_excel_prestamos(df_prestamos_all, df_pagos_export)
+                    st.download_button(label="📥 Exportar a Excel", data=excel_p,
+                        file_name=f"prestamos_{hora_colombia().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+
+        with p_tab2:
+            st.subheader("Registrar nuevo préstamo")
+            with st.form("form_prestamo", clear_on_submit=True):
+                col1p, col2p = st.columns(2)
+                with col1p:
+                    cond_nuevo_p    = st.selectbox("Conductor", lista_conductores_prest, key="p_cond_nuevo")
+                    fecha_prest     = st.date_input("Fecha del préstamo", value=datetime.today())
+                    monto_prest_txt = st.text_input("Monto (COP)", placeholder="Ej: 500.000")
+                    monto_prest     = limpiar(monto_prest_txt)
+                    if monto_prest > 0: st.caption(f"💵 {fmt(monto_prest)} COP")
+                with col2p:
+                    motivo_prest = st.text_input("Motivo", placeholder="Ej: Urgencia médica...")
+                    obs_prest    = st.text_area("Observaciones", height=80)
+
+                if st.form_submit_button("💾 Registrar Préstamo", type="primary"):
+                    if monto_prest <= 0:
+                        st.error("⚠️ El monto debe ser mayor a 0.")
+                    else:
+                        nid_p = db.registrar_prestamo({
+                            'conductor': cond_nuevo_p, 'monto_total': monto_prest,
+                            'fecha_prestamo': fecha_prest, 'motivo': motivo_prest.strip(),
+                            'observaciones': obs_prest.strip()
+                        })
+                        if nid_p:
+                            st.success(f"✅ Préstamo ID {nid_p} registrado para **{cond_nuevo_p}** — ${fmt(monto_prest)} COP")
+                            st.rerun()
+
+        with p_tab3:
+            st.subheader("Registrar pago / descuento")
+            df_activos   = db.obtener_prestamos(estado="activo")
+            df_pagos_chk = db.obtener_pagos()
+            if df_activos.empty:
+                st.success("✅ No hay préstamos activos.")
+            else:
+                opciones_prestamos = []
+                for _, pr in df_activos.iterrows():
+                    pagado, saldo = calcular_saldo_prestamo(pr['id'], pr['monto_total'], df_pagos_chk)
+                    if saldo > 0:
+                        opciones_prestamos.append({
+                            "id": pr['id'],
+                            "label": f"ID {pr['id']} | {pr['conductor']} | Saldo: ${fmt(saldo)}",
+                            "saldo": saldo, "conductor": pr['conductor'], "monto_total": pr['monto_total']
+                        })
+                if not opciones_prestamos:
+                    st.success("✅ Todos los préstamos activos están saldados.")
+                else:
+                    with st.form("form_pago", clear_on_submit=True):
+                        p_idx = st.selectbox("Préstamo", range(len(opciones_prestamos)),
+                            format_func=lambda i: opciones_prestamos[i]["label"], key="p_sel_pago")
+                        op = opciones_prestamos[p_idx]
+                        st.info(f"Saldo actual: **${fmt(op['saldo'])} COP**")
+                        col1pg, col2pg = st.columns(2)
+                        with col1pg:
+                            fecha_pago     = st.date_input("Fecha del descuento", value=datetime.today())
+                            monto_pago_txt = st.text_input("Monto del descuento (COP)")
+                            monto_pago     = limpiar(monto_pago_txt)
+                            if monto_pago > 0:
+                                st.caption(f"Saldo restante: **${fmt(max(0, op['saldo'] - monto_pago))} COP**")
+                        with col2pg:
+                            reg_por_pg = st.text_input("Registrado por")
+                            obs_pg     = st.text_area("Observaciones", height=80)
+
+                        if st.form_submit_button("💳 Registrar Descuento", type="primary"):
+                            if monto_pago <= 0:
+                                st.error("⚠️ Monto debe ser mayor a 0.")
+                            elif monto_pago > op['saldo']:
+                                st.error(f"⚠️ Supera el saldo (${fmt(op['saldo'])}).")
+                            elif not reg_por_pg.strip():
+                                st.error("⚠️ Ingresa tu nombre.")
+                            else:
+                                nid_pg = db.registrar_pago({
+                                    'prestamo_id': op['id'], 'monto_pago': monto_pago,
+                                    'fecha_pago': fecha_pago, 'observaciones': obs_pg.strip(),
+                                    'registrado_por': reg_por_pg.strip()
+                                })
+                                if nid_pg:
+                                    nuevo_saldo = max(0, op['saldo'] - monto_pago)
+                                    st.success(f"✅ Descuento registrado. Saldo: **${fmt(nuevo_saldo)} COP**")
+                                    if nuevo_saldo == 0:
+                                        db.actualizar_estado_prestamo(op['id'], 'saldado')
+                                        st.success(f"🎉 **{op['conductor']}** — PAZ Y SALVO")
+                                    st.rerun()
+
+    # ==================== TAB 6: CLIENTES ====================
+    with tab_clientes:
+        st.header("🏢 Gestión de Clientes")
+        st.subheader("Clientes predeterminados")
+        cols = st.columns(len(CLIENTES_DEFAULT))
+        for i, c_def in enumerate(CLIENTES_DEFAULT):
+            with cols[i]: st.info(c_def)
+        st.divider()
+        with st.form("form_nuevo_cliente", clear_on_submit=True):
+            nuevo_cliente = st.text_input("Nombre del cliente nuevo")
+            if st.form_submit_button("➕ Agregar Cliente", type="primary"):
+                if not nuevo_cliente.strip():
+                    st.error("⚠️ El nombre no puede estar vacío.")
+                elif nuevo_cliente.strip().upper() in [c.upper() for c in CLIENTES_DEFAULT]:
+                    st.warning("⚠️ Ya existe en la lista predeterminada.")
+                else:
+                    ok = db.agregar_cliente(nuevo_cliente.strip())
+                    if ok: st.success(f"✅ Cliente **{nuevo_cliente.strip().upper()}** agregado."); st.rerun()
+                    else: st.error("❌ Ya existe o hubo un error.")
+        st.divider()
+        df_extras = db.obtener_clientes_extra()
+        if df_extras.empty:
+            st.info("No hay clientes adicionales aún.")
+        else:
+            for _, row in df_extras.iterrows():
+                col_n, col_f, col_b = st.columns([3, 2, 1])
+                with col_n: st.write(f"**{row['nombre']}**")
+                with col_f: st.write(str(row['fecha_registro'])[:16])
+                with col_b:
+                    if st.session_state.confirmar_eliminar_cliente == row['id']:
+                        c_si, c_no = st.columns(2)
+                        with c_si:
+                            if st.button("Sí", key=f"si_cli_{row['id']}"):
+                                db.eliminar_cliente(row['id']); st.session_state.confirmar_eliminar_cliente = None; st.rerun()
+                        with c_no:
+                            if st.button("No", key=f"no_cli_{row['id']}"):
+                                st.session_state.confirmar_eliminar_cliente = None; st.rerun()
+                    else:
+                        if st.button("🗑️", key=f"del_cli_{row['id']}"):
+                            st.session_state.confirmar_eliminar_cliente = row['id']; st.rerun()
+
+    # ==================== TAB 7: CONDUCTORES ====================
+    with tab_conductores:
+        st.header("👤 Gestión de Conductores")
+        st.subheader("Conductores predeterminados")
+        cols_def = st.columns(4)
+        for i, c_def in enumerate(sorted(CONDUCTORES_DEFAULT)):
+            with cols_def[i % 4]: st.info(c_def)
+        st.divider()
+        with st.form("form_nuevo_conductor", clear_on_submit=True):
+            nuevo_conductor = st.text_input("Nombre del conductor nuevo")
+            if st.form_submit_button("➕ Agregar Conductor", type="primary"):
+                if not nuevo_conductor.strip():
+                    st.error("⚠️ El nombre no puede estar vacío.")
+                elif nuevo_conductor.strip().upper() in [c.upper() for c in CONDUCTORES_DEFAULT]:
+                    st.warning("⚠️ Ya existe en la lista predeterminada.")
+                else:
+                    ok = db.agregar_conductor(nuevo_conductor.strip())
+                    if ok: st.success(f"✅ **{nuevo_conductor.strip().upper()}** agregado."); st.rerun()
+                    else: st.error("❌ Ya existe o hubo un error.")
+        st.divider()
+        df_conductores = db.obtener_conductores_extra()
+        if df_conductores.empty:
+            st.info("No hay conductores adicionales registrados aún.")
+        else:
+            for _, row in df_conductores.iterrows():
+                col_nombre, col_fecha, col_edit, col_del = st.columns([3, 2, 1, 1])
+                with col_nombre:
+                    if st.session_state.editando_conductor_id == row['id']:
+                        nombre_editado = st.text_input("Nuevo nombre", value=row['nombre'],
+                            key=f"edit_input_{row['id']}", label_visibility="collapsed")
+                    else:
+                        st.write(f"**{row['nombre']}**")
+                with col_fecha:
+                    st.write(str(row['fecha_registro'])[:16])
+                with col_edit:
+                    if st.session_state.editando_conductor_id == row['id']:
+                        if st.button("💾", key=f"save_cond_{row['id']}"):
+                            if nombre_editado.strip():
+                                ok = db.editar_conductor(row['id'], nombre_editado.strip())
+                                if ok:
+                                    st.session_state.editando_conductor_id = None; st.rerun()
+                    else:
+                        if st.button("✏️", key=f"edit_cond_{row['id']}"):
+                            st.session_state.editando_conductor_id = row['id']; st.rerun()
+                with col_del:
+                    if st.session_state.editando_conductor_id == row['id']:
+                        if st.button("✖", key=f"cancel_cond_{row['id']}"):
+                            st.session_state.editando_conductor_id = None; st.rerun()
+                    elif st.session_state.confirmar_eliminar_conductor == row['id']:
+                        c_si2, c_no2 = st.columns(2)
+                        with c_si2:
+                            if st.button("Sí", key=f"si_cond_{row['id']}"):
+                                db.eliminar_conductor(row['id']); st.session_state.confirmar_eliminar_conductor = None; st.rerun()
+                        with c_no2:
+                            if st.button("No", key=f"no_cond_{row['id']}"):
+                                st.session_state.confirmar_eliminar_conductor = None; st.rerun()
+                    else:
+                        if st.button("🗑️", key=f"del_cond_{row['id']}"):
+                            st.session_state.confirmar_eliminar_conductor = row['id']; st.rerun()
 
         st.divider()
-        if st.button("💾 Guardar Inspección", type="primary", use_container_width=True, key="btn_guardar"):
-            if not maquina_sel:
-                st.error("⚠️ La máquina es obligatoria.")
-            else:
-                items_form = construir_items("new")
-                datos = {
-                    "fecha": fecha_insp, "maquina": maquina_sel,
-                    "modelo": modelo_inp, "marca": marca_inp, "placa": placa_inp,
-                    "trabajador": trabajador_inp, "revisado_por": revisado_inp,
-                    "cliente_proyecto": cliente_inp, "responsable_mantenimiento": resp_mant_inp,
-                    "estado": estado_inp.split(" ", 1)[1] if " " in estado_inp else estado_inp,
-                    "observaciones": obs_inp,
-                }
-                nc_count = sum(1 for it in items_form if it["resultado"] == "NC")
-                if db.guardar_inspeccion(datos, items_form):
-                    st.success(f"✅ Inspección guardada — {maquina_sel} | {fecha_insp} | {nc_count} NC detectadas")
-                    if nc_count > 0:
-                        st.warning(f"⚠️ Se detectaron **{nc_count} No Conformidades**. Reportar al encargado de mantenimiento.")
-                    st.balloons()
-
-    # =========================================================================
-    # TAB 2 – HISTORIAL
-    # =========================================================================
-    with tab2:
-        st.markdown("### 🔍 Historial de Inspecciones")
-
-        with st.expander("🛠️ Filtros", expanded=True):
-            f1, f2, f3, f4, f5 = st.columns(5)
-            with f1: fi    = st.date_input("Desde", datetime.now() - timedelta(days=30), key="h_fi")
-            with f2: ff    = st.date_input("Hasta", datetime.now(), key="h_ff")
-            with f3:
-                maq_opts = ["Todas"] + MAQUINAS
-                fm = st.selectbox("Máquina", maq_opts, key="h_fm")
-            with f4: ftrab = st.text_input("Trabajador", key="h_trab")
-            with f5:
-                est_opts = ["Todos"] + [e.split(" ", 1)[1] for e in ESTADOS_INSPECCION]
-                fe = st.selectbox("Estado", est_opts, key="h_fe")
-
-        df_hist = db.obtener_inspecciones(
-            fi, ff,
-            fm    if fm    != "Todas" else None,
-            fe    if fe    != "Todos" else None,
-            ftrab if ftrab else None
-        )
-
-        if not df_hist.empty:
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Total Inspecciones",       len(df_hist))
-            k2.metric("✅ Aprobadas",             len(df_hist[df_hist["estado"].str.contains("Aprobada",      na=False)]))
-            k3.metric("⚠️ Con Observaciones",     len(df_hist[df_hist["estado"].str.contains("Observaciones", na=False)]))
-            k4.metric("❌ Rechazadas",             len(df_hist[df_hist["estado"].str.contains("Rechazada",     na=False)]))
-
-            st.divider()
-            col_e1, col_e2 = st.columns([2, 5])
-            with col_e1:
-                nombre_rep = st.text_input("Nombre del reporte", value="Inspecciones_Preop", key="rep_nombre")
-            with col_e2:
-                st.markdown("<br>", unsafe_allow_html=True)
-                excel_data = generar_excel(df_hist, db, titulo=nombre_rep)
-                st.download_button(
-                    "⬇️ Descargar Excel", data=excel_data,
-                    file_name=f"{nombre_rep}_{datetime.now(pytz.timezone('America/Bogota')).strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary"
-                )
-
-            st.divider()
-            cols_tabla = ["id","fecha","maquina","trabajador","revisado_por",
-                          "cliente_proyecto","placa","estado","observaciones"]
-            cols_ex = [c for c in cols_tabla if c in df_hist.columns]
-            st.dataframe(df_hist[cols_ex], use_container_width=True, hide_index=True)
-
-            st.divider()
-            st.subheader("✏️ Ver Detalle / Editar")
-            df_hist["_label"] = df_hist.apply(
-                lambda r: f"ID {r['id']} | {r['fecha']} | {r['maquina']} | {r.get('trabajador','')} | {r.get('estado','')}",
-                axis=1
-            )
-            sel = st.selectbox("Seleccionar inspección:", df_hist["_label"].tolist(), key="h_sel")
-
-            if sel:
-                vid  = int(sel.split(" | ")[0].replace("ID ", ""))
-                row  = df_hist[df_hist["id"] == vid].iloc[0]
-                editando       = st.session_state.editando_id == vid
-                df_items_sel   = db.obtener_items_inspeccion(vid)
-
-                if not editando:
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        st.info(f"**Máquina:** {row['maquina']}")
-                        st.write(f"**Fecha:** {row['fecha']}")
-                        st.write(f"**Modelo:** {row.get('modelo','')}")
-                        st.write(f"**Marca:** {row.get('marca','')}")
-                        st.write(f"**Placa/Serie:** {row.get('placa','')}")
-                    with c2:
-                        st.write(f"**Trabajador:** {row.get('trabajador','')}")
-                        st.write(f"**Revisado por:** {row.get('revisado_por','')}")
-                        st.write(f"**Cliente/Proyecto:** {row.get('cliente_proyecto','')}")
-                        st.write(f"**Resp. Mantenimiento:** {row.get('responsable_mantenimiento','')}")
-                    with c3:
-                        estado_raw = str(row.get("estado",""))
-                        color = "🟢" if "Aprobada" in estado_raw else ("🔴" if "Rechazada" in estado_raw else "🟡")
-                        st.write(f"**Estado:** {color} {estado_raw}")
-                        st.write(f"**Observaciones:** {row.get('observaciones','')}")
-
-                    if not df_items_sel.empty:
-                        num_nc = len(df_items_sel[df_items_sel["resultado"] == "NC"])
-                        num_c  = len(df_items_sel[df_items_sel["resultado"] == "C"])
-                        st.write(f"**Resultado ítems:** 🟢 {num_c} Conformes · 🔴 {num_nc} No Conformes")
-                        for sec in df_items_sel["seccion"].unique():
-                            items_sec = df_items_sel[df_items_sel["seccion"] == sec]
-                            st.markdown(f"**{sec}**")
-                            for _, it in items_sec.iterrows():
-                                st.markdown(f"&nbsp;&nbsp;&nbsp;{it['item_numero']}. {it['descripcion']} → **{badge_resultado(it['resultado'])}**")
-
-                    bc1, bc2 = st.columns(2)
-                    with bc1:
-                        if st.button("✏️ Editar", key=f"eb_{vid}"):
-                            st.session_state.editando_id = vid
-                            st.rerun()
-                    with bc2:
-                        if st.button("🗑️ Eliminar", key=f"del_{vid}"):
-                            db.eliminar_inspeccion(vid)
-                            st.success("Eliminada.")
-                            st.rerun()
-
-                else:
-                    st.markdown("#### ✏️ Editando inspección")
-                    prev_vals = {}
-                    if not df_items_sel.empty:
-                        for _, it in df_items_sel.iterrows():
-                            sec   = it["seccion"]
-                            idx_i = int(it["item_numero"]) - 1
-                            if sec == "ANTES DE SU USO":
-                                prev_vals[f"edit_{vid}_au_{idx_i}"]   = it["resultado"]
-                            elif "PROTECCIÓN" in sec:
-                                prev_vals[f"edit_{vid}_epp_{idx_i}"]  = it["resultado"]
-                            elif "ELÉCTRICA" in sec:
-                                prev_vals[f"edit_{vid}_elec_{idx_i}"] = it["resultado"]
-
-                    ec1, ec2, ec3, ec4, ec5 = st.columns(5)
-                    with ec1: e_fecha  = st.date_input("Fecha",   value=row["fecha"],   key=f"ef_{vid}")
-                    with ec2:
-                        maq_idx = MAQUINAS.index(row["maquina"]) if row["maquina"] in MAQUINAS else 0
-                        e_maq   = st.selectbox("Máquina", MAQUINAS, index=maq_idx, key=f"em_{vid}")
-                    with ec3: e_modelo = st.text_input("Modelo", value=str(row.get("modelo","") or ""), key=f"emod_{vid}")
-                    with ec4: e_marca  = st.text_input("Marca",  value=str(row.get("marca", "") or ""), key=f"emarca_{vid}")
-                    with ec5: e_placa  = st.text_input("Placa",  value=str(row.get("placa", "") or ""), key=f"eplaca_{vid}")
-
-                    render_items_seccion("ANTES DE SU USO",                    ITEMS_ANTES_USO, f"edit_{vid}", "au",   prev_vals)
-                    render_items_seccion("ELEMENTOS DE PROTECCIÓN PERSONAL",   ITEMS_EPP,       f"edit_{vid}", "epp",  prev_vals)
-                    render_items_seccion("SEGURIDAD ELÉCTRICA",                ITEMS_ELECTRICA, f"edit_{vid}", "elec", prev_vals)
-
-                    with st.form(f"form_edit_{vid}"):
-                        ee1, ee2, ee3, ee4 = st.columns(4)
-                        with ee1: e_trab = st.text_input("Trabajador",       value=str(row.get("trabajador","")                or ""), key=f"etrab_{vid}")
-                        with ee2: e_rev  = st.text_input("Revisado por",     value=str(row.get("revisado_por","")              or ""), key=f"erev_{vid}")
-                        with ee3: e_cli  = st.text_input("Cliente/Proyecto", value=str(row.get("cliente_proyecto","")          or ""), key=f"ecli_{vid}")
-                        with ee4: e_mant = st.text_input("Resp. Mant.",      value=str(row.get("responsable_mantenimiento","") or ""), key=f"emant_{vid}")
-
-                        estados_l  = [e.split(" ", 1)[1] for e in ESTADOS_INSPECCION]
-                        est_actual = str(row.get("estado") or "Aprobada")
-                        est_idx    = estados_l.index(est_actual) if est_actual in estados_l else 0
-
-                        ef1, ef2 = st.columns([1, 3])
-                        with ef1: e_estado = st.selectbox("Estado", ESTADOS_INSPECCION, index=est_idx, key=f"eest_{vid}")
-                        with ef2: e_obs    = st.text_area("Observaciones", value=str(row.get("observaciones","") or ""),
-                                                           key=f"eobs_{vid}", height=80)
-
-                        sg1, sg2 = st.columns(2)
-                        with sg1: guardar  = st.form_submit_button("💾 Guardar Cambios", type="primary")
-                        with sg2: cancelar = st.form_submit_button("❌ Cancelar")
-
-                    if guardar:
-                        items_edit = construir_items(f"edit_{vid}")
-                        datos_edit = {
-                            "fecha": e_fecha, "maquina": e_maq, "modelo": e_modelo,
-                            "marca": e_marca, "placa": e_placa,
-                            "trabajador": e_trab, "revisado_por": e_rev,
-                            "cliente_proyecto": e_cli, "responsable_mantenimiento": e_mant,
-                            "estado": e_estado.split(" ", 1)[1] if " " in e_estado else e_estado,
-                            "observaciones": e_obs,
-                        }
-                        if db.actualizar_inspeccion(vid, datos_edit, items_edit):
-                            st.success("✅ Inspección actualizada.")
-                            st.session_state.editando_id = None
-                            st.rerun()
-                    if cancelar:
-                        st.session_state.editando_id = None
-                        st.rerun()
-        else:
-            st.warning("No hay inspecciones con los filtros seleccionados.")
-
-    # =========================================================================
-    # TAB 3 – DASHBOARD
-    # =========================================================================
-    with tab3:
-        st.markdown("### 📊 Dashboard de Inspecciones")
-        try:
-            import plotly.express as px
-
-            col_r1, _ = st.columns([2, 4])
-            with col_r1:
-                rango = st.date_input(
-                    "Período",
-                    value=(datetime.now().replace(day=1), datetime.now()),
-                    key="dash_rango"
-                )
-
-            if not (isinstance(rango, (list, tuple)) and len(rango) == 2):
-                st.info("Selecciona un rango de fechas completo.")
-                return
-
-            df_s = db.stats_dashboard(rango[0], rango[1])
-            if df_s.empty:
-                st.info("No hay datos en este período.")
-                return
-
-            total  = len(df_s)
-            apro   = len(df_s[df_s["estado"].str.contains("Aprobada",      na=False)])
-            obs_c  = len(df_s[df_s["estado"].str.contains("Observaciones", na=False)])
-            rech_c = len(df_s[df_s["estado"].str.contains("Rechazada",     na=False)])
-            pct    = round(apro / total * 100) if total > 0 else 0
-            total_nc = int(df_s["num_nc"].sum())
-
-            k1, k2, k3, k4, k5 = st.columns(5)
-            k1.metric("🔧 Total Inspecciones",  total)
-            k2.metric("✅ Aprobadas",            apro,     f"{pct}%")
-            k3.metric("⚠️ Con Observaciones",   obs_c)
-            k4.metric("❌ Rechazadas",           rech_c)
-            k5.metric("🔴 Total NC detectadas", total_nc)
-
-            st.divider()
-            g1, g2 = st.columns(2)
-            with g1:
-                st.markdown("#### Distribución por Estado")
-                est_c_df = df_s["estado"].value_counts().reset_index()
-                est_c_df.columns = ["estado","cantidad"]
-                colores_est = {"Aprobada":"#2ecc71","Con Observaciones":"#f39c12","Rechazada":"#e74c3c"}
-                fig1 = px.pie(est_c_df, values="cantidad", names="estado", hole=0.45,
-                              color="estado", color_discrete_map=colores_est)
-                fig1.update_layout(margin=dict(t=10,b=10), height=300)
-                st.plotly_chart(fig1, use_container_width=True)
-            with g2:
-                st.markdown("#### Inspecciones por Día")
-                df_dia = df_s.groupby("fecha").size().reset_index(name="inspecciones")
-                fig2 = px.bar(df_dia, x="fecha", y="inspecciones",
-                              color_discrete_sequence=["#2c5364"], text="inspecciones")
-                fig2.update_traces(textposition="outside")
-                fig2.update_layout(margin=dict(t=10,b=10), height=300, xaxis_title="", yaxis_title="Inspecciones")
-                st.plotly_chart(fig2, use_container_width=True)
-
-            st.divider()
-            g3, g4 = st.columns(2)
-            with g3:
-                st.markdown("#### Inspecciones por Máquina")
-                df_maq = df_s.groupby("maquina").size().reset_index(name="inspecciones").sort_values("inspecciones")
-                fig3 = px.bar(df_maq, x="inspecciones", y="maquina", orientation="h",
-                              color="inspecciones", color_continuous_scale="Blues", text="inspecciones")
-                fig3.update_traces(textposition="outside")
-                fig3.update_layout(margin=dict(t=10,b=10), height=max(250,len(df_maq)*45),
-                                   coloraxis_showscale=False, yaxis_title="", xaxis_title="Inspecciones")
-                st.plotly_chart(fig3, use_container_width=True)
-            with g4:
-                st.markdown("#### NC Promedio por Máquina")
-                df_nc_maq = df_s.groupby("maquina").agg(prom_nc=("num_nc","mean")).reset_index().sort_values("prom_nc")
-                df_nc_maq["prom_nc"] = df_nc_maq["prom_nc"].round(1)
-                fig4 = px.bar(df_nc_maq, x="prom_nc", y="maquina", orientation="h",
-                              color="prom_nc", color_continuous_scale="Reds", text="prom_nc")
-                fig4.update_traces(textposition="outside")
-                fig4.update_layout(margin=dict(t=10,b=10), height=max(250,len(df_nc_maq)*45),
-                                   coloraxis_showscale=False, yaxis_title="", xaxis_title="NC promedio")
-                st.plotly_chart(fig4, use_container_width=True)
-
-            st.divider()
-            g5, g6 = st.columns(2)
-            with g5:
-                st.markdown("#### % Aprobación por Máquina")
-                resumen_apr = df_s.groupby("maquina").apply(lambda g: pd.Series({
-                    "pct_apro": round(g["estado"].str.contains("Aprobada", na=False).sum() / len(g) * 100, 1)
-                })).reset_index().sort_values("pct_apro")
-                fig5 = px.bar(resumen_apr, x="pct_apro", y="maquina", orientation="h",
-                              color="pct_apro", color_continuous_scale="Greens",
-                              text="pct_apro", range_x=[0,100])
-                fig5.update_traces(texttemplate="%{text}%", textposition="outside")
-                fig5.update_layout(margin=dict(t=10,b=10), height=max(250,len(resumen_apr)*45),
-                                   coloraxis_showscale=False, yaxis_title="", xaxis_title="% Aprobación")
-                st.plotly_chart(fig5, use_container_width=True)
-            with g6:
-                st.markdown("#### 📅 Inspecciones por Día de la Semana")
-                df_s["dia_semana"] = pd.to_datetime(df_s["fecha"]).dt.day_name()
-                orden = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-                nombres_es = {"Monday":"Lunes","Tuesday":"Martes","Wednesday":"Miércoles",
-                              "Thursday":"Jueves","Friday":"Viernes","Saturday":"Sábado","Sunday":"Domingo"}
-                df_sem = df_s.groupby("dia_semana").size().reset_index(name="inspecciones")
-                df_sem["orden"] = df_sem["dia_semana"].map({d: i for i, d in enumerate(orden)})
-                df_sem = df_sem.sort_values("orden")
-                df_sem["dia_es"] = df_sem["dia_semana"].map(nombres_es)
-                fig6 = px.bar(df_sem, x="dia_es", y="inspecciones",
-                              color="inspecciones", color_continuous_scale="Oranges", text="inspecciones")
-                fig6.update_traces(textposition="outside")
-                fig6.update_layout(margin=dict(t=10,b=10), height=300,
-                                   coloraxis_showscale=False, xaxis_title="", yaxis_title="Inspecciones")
-                st.plotly_chart(fig6, use_container_width=True)
-
-            st.divider()
-            st.markdown("#### 🏆 Ranking de Inspectores")
-            df_insp = df_s[
-                df_s["trabajador"].notna() & (df_s["trabajador"].str.strip() != "")
-            ].groupby("trabajador").agg(
-                inspecciones=("trabajador","count"),
-                aprobadas   =("estado", lambda x: x.str.contains("Aprobada",      na=False).sum()),
-                con_obs     =("estado", lambda x: x.str.contains("Observaciones", na=False).sum()),
-                rechazadas  =("estado", lambda x: x.str.contains("Rechazada",     na=False).sum()),
-                total_nc    =("num_nc","sum"),
-            ).reset_index().sort_values("inspecciones", ascending=False).drop_duplicates(subset="trabajador")
-            df_insp["% Aprobación"] = (df_insp["aprobadas"] / df_insp["inspecciones"] * 100).round(1).astype(str) + "%"
-            df_insp["total_nc"]     = df_insp["total_nc"].astype(int)
-            df_insp.columns = ["Inspector","Total","✅ Aprob.","⚠️ Obs.","❌ Rech.","🔴 NC Total","% Aprobación"]
-            st.dataframe(df_insp, use_container_width=True, hide_index=True)
-
-        except ImportError:
-            st.warning("Instala plotly: `pip install plotly`")
-        except Exception as e:
-            st.error(f"Error en dashboard: {e}")
+        todos_conductores = get_lista_conductores(db)
+        cols_todos = st.columns(3)
+        for i, c in enumerate(todos_conductores):
+            with cols_todos[i % 3]: st.write(f"• {c}")
 
 
 if __name__ == "__main__":
